@@ -1,0 +1,74 @@
+steps:
+  # 1. Install devDependencies and run Tests/Linting
+  - name: 'node:20-alpine'
+    entrypoint: 'npm'
+    args: ['install']
+    dir: 'app'
+    id: 'Install Dev Dependencies'
+
+  - name: 'node:20-alpine'
+    entrypoint: 'npm'
+    args: ['run', 'test']
+    dir: 'app'
+    id: 'Run Unit Tests'
+
+  # 2. Build Docker Container using cache-from to optimize compile speeds
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - '$_GAR_REGION-docker.pkg.dev/$PROJECT_ID/$_GAR_REPO/app:$_IMAGE_TAG'
+      - './app'
+    id: 'Build Container'
+
+  # 3. Vulnerability Security Scan using Trivy
+  - name: 'aquasec/trivy:latest'
+    args:
+      - 'image'
+      - '--exit-code'
+      - '1' # Fail the build pipeline if CRITICAL issues are discovered
+      - '--severity'
+      - 'CRITICAL'
+      - '$_GAR_REGION-docker.pkg.dev/$PROJECT_ID/$_GAR_REPO/app:$_IMAGE_TAG'
+    id: 'Security Vulnerability Scan'
+
+  # 4. Push Container Image to Google Artifact Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - '$_GAR_REGION-docker.pkg.dev/$PROJECT_ID/$_GAR_REPO/app:$_IMAGE_TAG'
+    id: 'Push to Artifact Registry'
+
+  # 5. Deploy Serverless Endpoint to Cloud Run
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: 'gcloud'
+    args:
+      - 'run'
+      - 'deploy'
+      - '$_SERVICE_NAME'
+      - '--image=$_GAR_REGION-docker.pkg.dev/$PROJECT_ID/$_GAR_REPO/app:$_IMAGE_TAG'
+      - '--region=$_DEPLOY_REGION'
+      - '--platform=managed'
+      - '--allow-unauthenticated' # Set to false if API is private/internal
+      - '--port=8080'
+      - '--min-instances=0' # Scale to zero when idle to minimize cost
+      - '--max-instances=5' # Cost guardrail
+      - '--concurrency=80' # Request capacity per container before scaling
+      - '--cpu-throttling' # Throttle CPU when idle to optimize costs
+    id: 'Deploy to Cloud Run'
+
+# Default Substitutions (Can be overridden in triggers)
+substitutions:
+  _GAR_REGION: 'us-central1'
+  _GAR_REPO: 'devops-portfolio'
+  _SERVICE_NAME: 'web-service'
+  _DEPLOY_REGION: 'us-central1'
+  _IMAGE_TAG: 'latest'
+
+# Docker images built in the pipeline are tracked
+images:
+  - '$_GAR_REGION-docker.pkg.dev/$PROJECT_ID/$_GAR_REPO/app:$_IMAGE_TAG'
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+
