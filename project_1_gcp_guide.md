@@ -351,13 +351,17 @@ Use these 9 interactive debugging labs to intentionally break your deployment, o
 > **Interview Context:** "Your application starts up successfully and logs 'Listening on Port 3000', but Cloud Run returns a 502 Bad Gateway and reports a failed startup check. Why?"
 
 * **How to Break:**
-  1. Edit `app/server.js` and change `PORT = process.env.PORT || 8080` to `PORT = 3000`.
+  1. Edit `app/server.js` and change the port definition line to:
+     ```javascript
+     const PORT = 3000; // Hardcoded, completely omitting process.env.PORT
+     ```
+     *(Note: If you write `process.env.PORT || 3000`, Cloud Run overrides it with `8080` at startup, and it will still deploy successfully!)*
   2. Deploy this container configuration while keeping Cloud Run's port setting at the default `8080`.
 * **The Symptoms:**
   Cloud Run deployment fails with:
   `Cloud Run error: Container failed to start. Failed to start and then listen on the port defined by the PORT environment variable.`
 * **The Learn:**
-  Cloud Run passes a dynamic `PORT` environment variable to the container (defaulting to `8080`) and listens on that port. If you hardcode a different port (like `3000`), Cloud Run's routing plane will send health checks to `8080`, receive no response, and declare the container dead.
+  Cloud Run injects a dynamic `PORT` environment variable (typically `8080`) into the running container container and routes traffic there. If your code ignores the environment variable and binds strictly to a hardcoded port (like `3000`), the Cloud Run health checking plane will check port `8080`, receive no response, and terminate the container.
 * **How to Fix:**
   Restore the port assignment to rely on the environment variable inside `app/server.js`:
   ```javascript
@@ -418,15 +422,41 @@ Use these 9 interactive debugging labs to intentionally break your deployment, o
 > **Interview Context:** "Your application starts up successfully in development, but under serverless configurations, it crashes during cold-starts. How do you mitigate startup latency issues?"
 
 * **How to Break:**
-  1. Add a heavy, blocking synchronous loop at the global scope of your `app/server.js` (e.g., a loop calculating Fibonacci numbers that takes 25 seconds before calling `app.listen`).
+  1. Add a synchronous infinite loop at the global scope of your `app/server.js`:
+     ```javascript
+     console.log("Simulating CPU-heavy container initialization cold-start...");
+     while (true) {
+       // Blocks the single-threaded Node.js event loop indefinitely
+     }
+     ```
   2. Deploy to Cloud Run.
 * **The Symptoms:**
-  Client requests time out and Cloud Run logs report:
-  `Container startup health check failed. Revision crashed.`
+  The deployment hangs for up to 4 minutes and fails with:
+  `ERROR: (gcloud.run.deploy) The user-provided container failed to start and listen on the port defined provided by the PORT=8080 environment variable within the allocated timeout.`
 * **The Learn:**
-  When scaling from 0 to 1 instance (a cold start), Cloud Run expects the container to start listening for HTTP traffic within a defined health check timeout window. Synchronous startup logic blocks the event loop, causing health check failures.
+  This scenario demonstrates three critical concepts:
+  
+  1. **Single-Threaded Event Loop Blocking (Node.js)**: Node.js is single-threaded. When a CPU-intensive synchronous task (like `while(true)`) runs, it completely monopolizes the call stack. The event loop cannot tick, meaning asynchronous functions, file input/output, and network operations (like `app.listen()` to bind to port `8080`) are blocked and never execute.
+  
+  2. **Serverless Orchestrator Lifecycle and Startup Probes**: When Cloud Run deploys a new container revision, it boots the instance inside its sandbox and immediately begins polling the designated container port (default `8080`) using a TCP/HTTP startup probe. If the application does not start responding on that port within the allocated grace period (default 240 seconds), the orchestrator assumes the container has crashed or hung, destroys it, and rolls back traffic to the previous healthy revision to preserve uptime.
+  
+  3. **Cold Start Resource Limitations**: During a cold start (scaling from 0 to 1 instance), serverless runtimes experience peak CPU usage while initializing memory pages and running startup routines. When CPU is throttled during idle states, any initialization calculations take significantly longer, heightening the risk of hitting health check timeout limits.
+  
 * **How to Fix:**
-  Optimize startup code to load asynchronously after the port is bound, increase the Cloud Run startup timeout limits using `--startup-cpu-boost`, or increase the initial delay parameters.
+  1. **Application-Level Resolution**: Always delegate heavy computation, database connections, or cache warming to asynchronous routines. Let the server bind to the port immediately, and perform initialization steps without blocking the event loop:
+     ```javascript
+     const server = app.listen(PORT, '0.0.0.0', () => {
+       console.log(`Port bound successfully!`);
+       // Trigger async cache warming
+       setImmediate(async () => {
+         await runWarmupTasks();
+       });
+     });
+     ```
+  2. **Infrastructure-Level Resolution**: For legacy applications with unavoidable slow startup sequences, adjust the infrastructure settings:
+     - Increase the startup grace period using the `--timeout` flag (up to 3600 seconds).
+     - Enable **Startup CPU Boost** (`--startup-cpu-boost`) to allocate extra CPU cores during initialization to decrease boot latency.
+
 
 ---
 
