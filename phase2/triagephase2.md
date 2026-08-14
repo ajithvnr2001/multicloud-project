@@ -458,15 +458,122 @@ resource "google_container_cluster" "gke_cluster" {
 
 ---
 
-### Scenario 5: Immutable Infrastructure vs Deletion Protection
-**Question:**
-> *"Why should `deletion_protection = true` be used in production, and how do you handle necessary cluster replacements without causing an outage?"*
+---
 
+# 4. Multi-Cloud Architecture & Interview Comparison: GCP (GKE) vs. AWS (EKS)
+
+To excel in Senior Multi-Cloud DevOps and SRE interviews, you must know how every GCP component implemented in Phase 2 translates to its **exact AWS equivalent**, how errors manifest on AWS, and how to triage them.
+
+---
+
+### Component-by-Component Architectural Mapping
+
+| Architecture Layer | Google Cloud Platform (GCP - Implemented) | Amazon Web Services (AWS - Equivalent) | Key Differences & AWS Implementation Notes |
+|---|---|---|---|
+| **Managed Kubernetes** | **Google Kubernetes Engine (GKE)** | **Amazon Elastic Kubernetes Service (EKS)** | GKE manages master VMs automatically; EKS requires VPC subnets tagged with `kubernetes.io/role/elb` and `kubernetes.io/cluster/<cluster-name>`. |
+| **Pod IAM / Security** | **Workload Identity** (`roles/iam.workloadIdentityUser`) | **IAM Roles for Service Accounts (IRSA)** / **EKS Pod Identities** | GCP uses GKE Metadata Server (`PROJECT_ID.svc.id.goog`); AWS uses OIDC Identity Provider + `sts:AssumeRoleWithWebIdentity` with `eks.amazonaws.com/role-arn` annotation. |
+| **Managed Relational DB** | **Cloud SQL PostgreSQL 15** | **Amazon RDS PostgreSQL / Amazon Aurora PostgreSQL** | GCP connects via Private Service Access (PSA VPC Peering); AWS places RDS into a dedicated `DBSubnetGroup` spanning multiple Availability Zones with Security Groups. |
+| **Private DB Connection** | **Cloud SQL Auth Proxy 2.x Sidecar** (`127.0.0.1:5432`) | **AWS RDS IAM Authentication / RDS Proxy** | AWS RDS Proxy pools database connections and integrates with AWS Secrets Manager without needing sidecar containers. |
+| **Container Networking** | **Dataplane V2 (Cilium eBPF)** | **AWS VPC CNI + AWS Network Policy Engine (eBPF)** | AWS VPC CNI assigns native secondary ENI private IPs to Pods; supports native eBPF network policies (added in VPC CNI 1.14+). |
+| **Ingress / Layer 7 LB** | **GCE Ingress + Container-Native NEGs + BackendConfig** | **AWS Load Balancer Controller + TargetGroupBinding (IP Mode)** | GCP uses NEGs; AWS uses Application Load Balancers (ALB) routing directly to Pod IPs via `alb.ingress.kubernetes.io/target-type: ip`. |
+| **Edge Security (WAF)** | **Google Cloud Armor** | **AWS WAFv2** | GCP binds Cloud Armor via `BackendConfig`; AWS binds WAF via ALB annotation: `alb.ingress.kubernetes.io/wafv2-acl-arn`. |
+| **CI/CD & Security Scan** | **Cloud Build + Trivy + Artifact Registry** | **AWS CodeBuild + Trivy + Amazon ECR** | GCP pushes to `us-east4-docker.pkg.dev`; AWS pushes to `<account-id>.dkr.ecr.<region>.amazonaws.com`. |
+
+---
+
+### AWS-Specific Incident Scenarios & Troubleshooting (The AWS Equivalent of Our 10 GCP Errors)
+
+#### **1. The AWS Equivalent of "Identity Pool does not exist" (IRSA OIDC Missing)**
+- **GCP Incident**: IAM binding failed because `PROJECT_ID.svc.id.goog` pool was not active.
+- **AWS Counterpart Error**:
+  ```text
+  An error occurred (AccessDenied) when calling the AssumeRoleWithWebIdentity operation: 
+  Not authorized to perform sts:AssumeRoleWithWebIdentity
+  ```
+- **Root Cause**: The EKS cluster IAM OIDC Provider (`oidc.eks.<region>.amazonaws.com/id/<ID>`) was not associated with IAM via `aws_iam_openid_connect_provider` in Terraform before the IRSA role trust policy was created.
+- **Resolution**: Establish an explicit dependency in Terraform:
+  ```hcl
+  resource "aws_iam_role" "app_irsa" {
+    name = "eks-app-backend-irsa"
+    assume_role_policy = jsonencode({
+      Version = "2012-10-17"
+      Statement = [{
+        Action = "sts:AssumeRoleWithWebIdentity"
+        Effect = "Allow"
+        Principal = { Federated = aws_iam_openid_connect_provider.eks.arn }
+        Condition = {
+          StringEquals = {
+            "${replace(aws_iam_openid_connect_provider.eks.url, "https://", "")}:sub" : "system:serviceaccount:default:ksa-app-backend"
+          }
+        }
+      }]
+    })
+  }
+  ```
+
+---
+
+#### **2. The AWS Equivalent of "GCE_STOCKOUT" (`InsufficientInstanceCapacity`)**
+- **GCP Incident**: GCP data center ran out of `e2-standard-2` hypervisors in `us-central1`.
+- **AWS Counterpart Error**:
+  ```text
+  [Client.InsufficientInstanceCapacity]: We currently do not have sufficient t3.medium capacity in the Availability Zone you requested (us-east-1a).
+  ```
+- **Resolution**:
+  1. In Auto Scaling Group / EKS Managed Node Group, configure **Mixed Instances Policy** (e.g. `t3.medium`, `t3a.medium`, `m5.large`).
+  2. Implement **AWS Karpenter** (JIT node autoscaler) which dynamically selects available instance types with lowest cost across AZs without manual pool provisioning.
+
+---
+
+#### **3. The AWS Equivalent of "PSA Peering Deletion Block" (RDS Network Interface Lock)**
+- **GCP Incident**: Service Networking Peering could not be deleted because Cloud SQL held internal tombstone network attachments.
+- **AWS Counterpart Error**:
+  ```text
+  DependencyViolation: The vpc 'vpc-xxxx' has dependencies and cannot be deleted. Network interfaces still attached.
+  ```
+- **Root Cause**: When an RDS instance or Lambda in a VPC is deleted, AWS Elastic Network Interfaces (ENIs) take several minutes to transition from `in-use` to `available` before AWS garbage collection deletes them.
+- **Resolution**:
+  ```bash
+  # Find lingering ENIs attached to the VPC
+  aws ec2 describe-network-interfaces --filters "Name=vpc-id,Values=vpc-xxxx"
+
+  # Force delete detached ENIs
+  aws ec2 delete-network-interface --network-interface-id eni-xxxx
+  ```
+
+---
+
+#### **4. The AWS Equivalent of GKE Dataplane V2 NetworkPolicy Blocking**
+- **GCP Incident**: Cilium eBPF blocked unauthorized test pods from accessing `backend-service:8080`.
+- **AWS Counterpart**: AWS VPC CNI with `enableNetworkPolicy: "true"` enforces standard Kubernetes NetworkPolicies directly in the Linux kernel eBPF layer on Amazon Linux / Bottlerocket nodes, operating identically with zero iptables overhead.
+
+---
+
+### Senior Multi-Cloud DevOps Interview Questions & Model Answers
+
+#### **Q1: "Compare GKE Workload Identity with AWS EKS IRSA. Which is easier to manage and why?"**
 **Model Answer:**
-> *"In production environments:
-> 1. `deletion_protection = true` acts as an out-of-band safety lock preventing accidental `terraform destroy` or unintended replacement due to parameter drift from wiping out live workloads.
-> 2. In production, we **never** perform in-place cluster destruction for upgrades. Instead, we use **Blue/Green Cluster Migration**:
->    - Spin up a new cluster (`gke-3tier-prod-v2`).
->    - Deploy microservices and validate health.
->    - Shift external traffic at the Global Cloud Load Balancer (or DNS) layer via weighted backend services.
->    - Drain and decommission the old cluster after full validation."*
+> *"Both solve the same security challenge: eliminating hardcoded static cloud credentials in containers by dynamically exchanging Kubernetes ServiceAccount JWTs for short-lived cloud IAM tokens.
+> 
+> - **GKE Workload Identity** is simpler and more integrated: GCP provisions the metadata server emulator (`gke-metadata-server`) automatically on each node, intercepting requests to `169.254.169.254`. You only need to annotate the KSA with `iam.gke.io/gcp-service-account` and grant `roles/iam.workloadIdentityUser`.
+> - **AWS EKS IRSA** requires creating an IAM OIDC Identity Provider in AWS IAM, writing an `AssumeRoleWithWebIdentity` trust policy with condition keys matching the namespace and KSA name, and injecting AWS SDK environment variables (`AWS_ROLE_ARN`, `AWS_WEB_IDENTITY_TOKEN_FILE`) via the EKS Pod Identity mutating webhook.
+> - Recently, AWS released **EKS Pod Identities** which simplifies this closer to GCP's model using an in-cluster daemonset agent without requiring OIDC federation."*
+
+---
+
+#### **Q2: "How does ingress traffic routing differ between GKE (Container-Native NEGs) and AWS EKS (ALB IP Mode)?"**
+**Model Answer:**
+> *"In traditional Kubernetes on both clouds, an external Load Balancer routes traffic to Node VMs on a NodePort, and `kube-proxy` performs SNAT and hops the packet to the actual Pod IP (NodePort Mode). This causes extra network latency and obscures client source IPs.
+> 
+> In our production architecture:
+> - **GCP GKE** uses **Container-Native Network Endpoint Groups (NEGs)** (`cloud.google.com/neg: '{"ingress": true}'`), allowing the Google Global HTTP(S) Load Balancer to program Pod IPs directly as backend targets via Dataplane V2 eBPF.
+> - **AWS EKS** achieves the exact same architecture using the **AWS Load Balancer Controller** with Target Type set to IP mode (`alb.ingress.kubernetes.io/target-type: ip`). The ALB registers Pod ENI secondary IPs directly into the AWS Target Group, bypassing kube-proxy and NodePorts."*
+
+---
+
+#### **Q3: "If you had to design a Disaster Recovery (DR) Active-Passive multi-cloud architecture between GCP (Primary) and AWS (Secondary), how would you structure the 3 tiers?"**
+**Model Answer:**
+> *"1. **Tier 1 (Edge & Web)**: Route 53 or Cloudflare Global Traffic Manager with DNS health checks. Under normal operations, 100% of traffic routes to GCP Global Load Balancer. On GCP outage, DNS automatically fails over to the AWS Application Load Balancer.
+> 2. **Tier 2 (App)**: Identical stateless container images built via multi-arch CI/CD (Trivy scanned) and mirrored across GCP Artifact Registry and Amazon ECR. Kubernetes manifests deployed identically on GKE and EKS.
+> 3. **Tier 3 (Database)**: Cloud SQL PostgreSQL (Primary in GCP) continuously streaming asynchronous replication across a dedicated Cloud VPN / DirectConnect / Interconnect tunnel to an Amazon RDS PostgreSQL Read Replica in AWS. On disaster declaration, promote the AWS RDS read replica to standalone primary and point EKS backend pods to RDS."*
+

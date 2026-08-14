@@ -672,3 +672,71 @@ kubectl get pods -o custom-columns=NAME:.metadata.name,CPU_REQ:.spec.containers[
 | **DNS Resolution Failure** | `kubectl exec -it <POD> -- nslookup kubernetes.default` | NetworkPolicy is blocking egress UDP port 53 to `k8s-app: kube-dns`, or `kube-dns` / `node-local-dns` pods are crashed. |
 | **Workload Identity `403`** | `kubectl describe sa <KSA>` | Missing `iam.gke.io/gcp-service-account` annotation on KSA, or missing `roles/iam.workloadIdentityUser` binding on GCP IAM SA. |
 | **Delete Stuck Terminating Pod**| `kubectl delete pod <POD> --grace-period=0 --force` | Underlying Node VM became unresponsive/lost network connectivity while holding pod lock. |
+
+---
+
+# 5. Multi-Cloud Companion: AWS EKS Core System Pods, Daemons & Equivalents
+
+When managing Kubernetes on **Amazon Web Services (AWS EKS)**, the architecture mirrors GKE with AWS-native controllers and daemonsets:
+
+---
+
+### 5.1 AWS EKS System Pods & Daemons Breakdown
+
+```
+┌──────────────────────────────────────┬──────────────────────────────────────┬────────────────────────────────────────────────────────┐
+│ Function / Layer                     │ GKE System Pod (GCP)                 │ AWS EKS System Pod (AWS)                               │
+├──────────────────────────────────────┼──────────────────────────────────────┼────────────────────────────────────────────────────────┤
+│ **Container Networking (CNI)**       │ `netd` / Dataplane V2 (Cilium eBPF)   │ `aws-node` (AWS VPC CNI DaemonSet)                     │
+│ **Internal DNS**                     │ `kube-dns` + `node-local-dns`        │ `coredns` + NodeLocal DNSCache                         │
+│ **Cluster Proxy**                    │ Managed eBPF kernel maps             │ `kube-proxy` (iptables/IPVS daemonset)                 │
+│ **Storage Controller**               │ `pdcsi-node` (Compute Engine PD)     │ `aws-ebs-csi-driver-node` / `ebs-csi-controller`       │
+│ **IAM & Identity Engine**            │ `gke-metadata-server`                │ `eks-pod-identity-agent` / AWS STS OIDC Webhook        │
+│ **Ingress / ALB Controller**         │ `loadbalancer-controller` (GCE)      │ `aws-load-balancer-controller`                         │
+│ **Logging & Monitoring**             │ `fluentbit-gke` + `gke-metrics-agent`│ `aws-for-fluent-bit` + `amazon-cloudwatch-agent`       │
+│ **Node Autoscaling**                 │ GKE Cluster Autoscaler               │ **Karpenter** / `cluster-autoscaler`                   │
+└──────────────────────────────────────┴──────────────────────────────────────┴────────────────────────────────────────────────────────┘
+```
+
+#### **1. `aws-node` (AWS VPC CNI DaemonSet)**
+- **Namespace**: `kube-system`
+- **What it does**: Allocates native AWS VPC Secondary Private IP addresses directly to Pods from the node's Elastic Network Interfaces (ENIs).
+- **Why it matters**: Allows Pods to communicate directly with Amazon RDS, ElastiCache, and other VPC services without NAT or overlay routing.
+
+#### **2. `coredns` (Deployment)**
+- **Namespace**: `kube-system`
+- **What it does**: Default DNS service discovery for Amazon EKS clusters.
+
+#### **3. `aws-ebs-csi-driver-node` (DaemonSet)**
+- **Namespace**: `kube-system`
+- **What it does**: CSI driver that communicates with AWS EC2 API to provision, attach, format, and mount Amazon Elastic Block Store (EBS `gp3`/`io2`) volumes into Pods.
+
+#### **4. `eks-pod-identity-agent` (DaemonSet)**
+- **Namespace**: `kube-system`
+- **What it does**: The AWS equivalent of `gke-metadata-server`. Intercepts metadata calls and provides temporary AWS IAM credentials to pods using EKS Pod Identity associations.
+
+#### **5. `aws-load-balancer-controller` (Deployment)**
+- **Namespace**: `kube-system`
+- **What it does**: Manages AWS Application Load Balancers (ALB) and Network Load Balancers (NLB). Automatically provisions target groups and configures IP mode routing (`alb.ingress.kubernetes.io/target-type: ip`).
+
+---
+
+### 5.2 Essential AWS CLI + `kubectl` Workflow Commands
+
+```bash
+# 1. Update kubeconfig to connect to an Amazon EKS Cluster
+aws eks update-kubeconfig --region us-east-1 --name eks-3tier-prod
+
+# 2. Check AWS CNI health on all nodes
+kubectl get daemonset aws-node -n kube-system
+
+# 3. Check AWS Load Balancer Controller logs for Ingress provisioning errors
+kubectl logs -n kube-system deployment/aws-load-balancer-controller --tail=50 -f
+
+# 4. Check AWS EBS CSI Driver logs for persistent volume mount failures
+kubectl logs -n kube-system -l app=ebs-csi-node -c ebs-plugin --tail=50
+
+# 5. Verify IRSA / IAM Role annotation on Kubernetes Service Account in AWS
+kubectl describe sa ksa-app-backend | grep -i "eks.amazonaws.com/role-arn"
+```
+
