@@ -683,3 +683,72 @@ resource "google_container_cluster" "gke_cluster" {
 > 2. **Tier 2 (App)**: Identical stateless container images built via multi-arch CI/CD (Trivy scanned) and mirrored across GCP Artifact Registry and Amazon ECR. Kubernetes manifests deployed identically on GKE and EKS.
 > 3. **Tier 3 (Database)**: Cloud SQL PostgreSQL (Primary in GCP) continuously streaming asynchronous replication across a dedicated Cloud VPN / DirectConnect / Interconnect tunnel to an Amazon RDS PostgreSQL Read Replica in AWS. On disaster declaration, promote the AWS RDS read replica to standalone primary and point EKS backend pods to RDS."*
 
+---
+
+# 5. Exhaustive Multi-Cloud & Kubernetes Glossary & Reference Guide
+
+This section breaks down **every acronym, environment variable, service name, and technical abbreviation** used across GCP, AWS, Kubernetes, and Linux networking in this project.
+
+---
+
+### 5.1 Cloud Identity, Security & Environment Variables
+
+| Term / Variable | Full Expanded Form | Cloud / Context | Deep Technical Explanation |
+|---|---|---|---|
+| **`AWS_ROLE_ARN`** | Amazon Web Services Amazon Resource Name for IAM Role | AWS (IRSA) | An environment variable automatically injected into an EKS Pod by the IRSA mutating webhook. It tells the AWS SDK which IAM Role (e.g. `arn:aws:iam::123456789012:role/eks-app-backend-irsa`) the container should assume. |
+| **`AWS_WEB_IDENTITY_TOKEN_FILE`** | Path to the Projected OpenID Connect (OIDC) JWT Token File | AWS (IRSA) | An environment variable pointing to the filesystem location (`/var/run/secrets/eks.amazonaws.com/serviceaccount/token`) where Kubernetes mounts the signed OIDC JSON Web Token for the ServiceAccount. The AWS SDK reads this file and passes it to AWS STS. |
+| **`STS`** | **Security Token Service** | AWS / GCP | A web service that provides trusted callers with temporary, limited-privilege security credentials (`AccessKeyId`, `SecretAccessKey`, `SessionToken`) that expire automatically (typically in 1 hour). |
+| **`IRSA`** | **IAM Roles for Service Accounts** | AWS (EKS) | The AWS feature that connects a Kubernetes ServiceAccount to an AWS IAM Role via OpenID Connect (OIDC) federation, eliminating static AWS access keys inside pods. |
+| **`ARN`** | **Amazon Resource Name** | AWS | The unique string identifier for any AWS resource globally (e.g., `arn:aws:s3:::my-bucket` or `arn:aws:iam::123456789012:role/my-role`). |
+| **`KSA`** | **Kubernetes Service Account** | Kubernetes | A native Kubernetes resource (`kind: ServiceAccount`) that provides an identity for processes running inside a Pod to authenticate with the `kube-apiserver` and cloud IAM. |
+| **`GSA`** | **Google Service Account** | GCP | A Google Cloud IAM identity (e.g., `sa-app-backend@project.iam.gserviceaccount.com`) used by applications and VM instances to make authorized calls to Google Cloud APIs. |
+| **`WI`** | **Workload Identity** | GCP (GKE) | The GCP mechanism that links a KSA to a GSA via the GKE metadata server emulator, allowing pods to call Google Cloud APIs (Cloud SQL, Cloud Storage) without static JSON credential keys. |
+| **`OIDC`** | **OpenID Connect** | Standard / Identity | An identity authentication protocol built on top of OAuth 2.0 that allows clients to verify the identity of an end-user or workload based on authentication performed by an authorization server (JWT issuer). |
+| **`JWT`** | **JSON Web Token** | Standard / Security | A digitally signed, cryptographically verifiable token containing claims (e.g., issuer `iss`, subject `sub`, expiration `exp`) formatted as `header.payload.signature`. |
+| **`RBAC`** | **Role-Based Access Control** | Kubernetes / Cloud | An access control model that grants permissions based on an entity's assigned roles (`Role`, `ClusterRole`, `RoleBinding`, `ClusterRoleBinding`). |
+
+---
+
+### 5.2 Networking & Load Balancing Terminology
+
+| Term / Abbreviation | Full Name | Cloud / Context | Deep Technical Explanation |
+|---|---|---|---|
+| **`NEG`** | **Network Endpoint Group** | GCP | A GCP configuration object that specifies a group of backend endpoints (IP address + Port). In GKE, **Standalone Container-Native NEGs** map directly to individual Pod IPs, allowing GCP Load Balancers to route traffic straight to pods without NodePort or `kube-proxy` translation. |
+| **`ALB`** | **Application Load Balancer** | AWS | An AWS Elastic Load Balancing (ELB) service operating at Layer 7 (HTTP/HTTPS) supporting path-based routing, host-based routing, SSL termination, and direct container target groups. |
+| **`NLB`** | **Network Load Balancer** | AWS | An ultra-high performance Layer 4 (TCP/UDP) load balancer capable of handling millions of requests per second with ultra-low latency. |
+| **`WAF`** | **Web Application Firewall** | Cloud Security | A security layer that monitors and filters incoming HTTP/S traffic against common web exploits (SQL Injection, Cross-Site Scripting XSS, HTTP flood DDoS, rate limiting). |
+| **`PSA`** | **Private Service Access** | GCP | A private connection between your VPC network and a Google-managed Tenant VPC (hosting services like Cloud SQL, Cloud Memcache) over an internal peered IP range. |
+| **`CNI`** | **Container Network Interface** | Kubernetes | The standard specification and plugin ecosystem (e.g., AWS VPC CNI, Cilium, Calico) responsible for allocating IP addresses and configuring virtual network interfaces (`veth`) for pods. |
+| **`ENI`** | **Elastic Network Interface** | AWS | A virtual network interface card attached to an EC2 instance in a VPC. The AWS VPC CNI allocates secondary private IPv4 addresses from the node's ENIs directly to Pods. |
+| **`eBPF`** | **Extended Berkeley Packet Filter** | Linux Kernel | A revolution in Linux kernel programming that allows running sandboxed, high-performance bytecode programs directly in the operating system kernel without modifying kernel source code. Used by GKE Dataplane V2 and Cilium for $O(1)$ networking, security filtering, and observability. |
+| **`SNAT`** | **Source Network Address Translation** | Networking | Replaces the private source IP address of an outbound packet with the public/gateway IP of the router/NAT before forwarding it to external networks. |
+| **`CIDR`** | **Classless Inter-Domain Routing** | Networking | A notation method for allocating IP addresses and routing IP packets (e.g. `10.0.0.0/16` = 65,536 IPs; `10.0.2.0/24` = 256 IPs). |
+
+---
+
+### 5.3 Database & Storage Terminology
+
+| Term / Abbreviation | Full Name | Context | Deep Technical Explanation |
+|---|---|---|---|
+| **`PSA Peering`** | **Private Service Access Peering** | GCP | VPC Peering established with Google's Service Networking tenant project (`servicenetworking.googleapis.com`) to enable private IP connectivity for Cloud SQL. |
+| **`RDS`** | **Relational Database Service** | AWS | Amazon's managed database service supporting PostgreSQL, MySQL, MariaDB, Oracle, and Microsoft SQL Server with automated backups, Multi-AZ replication, and patching. |
+| **`Aurora`** | **Amazon Aurora** | AWS | A cloud-native relational database engine compatible with PostgreSQL and MySQL that separates compute from a distributed 6-way replicated storage subsystem. |
+| **`CSI`** | **Container Storage Interface** | Kubernetes | An industry-standard interface that allows storage vendors (AWS EBS, GCP Persistent Disk, Azure Disk) to write plugins that attach, format, and mount block/file storage into Kubernetes pods. |
+| **`PV`** | **PersistentVolume** | Kubernetes | A piece of storage in the cluster provisioned by an administrator or dynamically created by a `StorageClass` (e.g., a 50GB GCP Persistent Disk). |
+| **`PVC`** | **PersistentVolumeClaim** | Kubernetes | A user's request for storage with specific capacity and access modes (`ReadWriteOnce`, `ReadWriteMany`). |
+| **`SC`** | **StorageClass** | Kubernetes | Defines the provisioner, volume type, IOPS parameters, and reclaim policy (`Delete` vs `Retain`) for dynamic volume provisioning. |
+
+---
+
+### 5.4 Compute & Scaling Terminology
+
+| Term / Abbreviation | Full Name | Context | Deep Technical Explanation |
+|---|---|---|---|
+| **`HPA`** | **Horizontal Pod Autoscaler** | Kubernetes | A control loop that automatically scales the number of Pod replicas in a Deployment or StatefulSet based on observed CPU utilization, Memory, or custom Prometheus metrics. |
+| **`MIG`** | **Managed Instance Group** | GCP | A collection of identical Compute Engine VM instances managed as a single entity based on an Instance Template. GKE node pools are built on top of GCP MIGs. |
+| **`ASG`** | **Auto Scaling Group** | AWS | The AWS equivalent of a MIG; manages a collection of EC2 instances, automatically scaling up/down and replacing unhealthy instances across multiple Availability Zones. |
+| **`Karpenter`** | **Karpenter Kubernetes Autoscaler** | Kubernetes / AWS | An open-source, high-performance, JIT (Just-In-Time) node provisioning engine that bypasses traditional Auto Scaling Groups to launch exact-sized EC2 instances directly based on unschedulable pod requirements in seconds. |
+| **`COS`** | **Container-Optimized OS** | GCP | A minimal, security-hardened Linux operating system developed by Google specifically optimized for running Docker and `containerd` containers on GKE node VMs. |
+| **`OOMKilled`** | **Out Of Memory Killed (Exit Code 137)** | Linux / Kubernetes | An event where the Linux kernel Out-Of-Memory (OOM) killer forcefully terminates a container process with `SIGKILL` (`128 + 9 = 137`) because its physical RAM usage exceeded `resources.limits.memory`. |
+
+
