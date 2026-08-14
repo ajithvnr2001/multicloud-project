@@ -333,40 +333,251 @@ kubectl get pv
 
 ---
 
-### 3.5 Deep-Dive Debugging & Observability
+### 3.5 Deep-Dive Debugging & Observability (Logs, Events, Exec, Top, Port-Forward)
 
-#### **`kubectl logs`**
-- **Under the Hood**: Kubelet reads `/var/log/pods/<NAMESPACE>_<NAME>_<UID>/<CONTAINER>/` on the node host and streams the bytes back over the SPDY/HTTP2 API connection.
-- **Flags**:
-  - `-c <CONTAINER>`: Selects container in multi-container pod (`api-app` vs `cloud-sql-proxy`).
-  - `-f`: Follows/tails log output.
-  - `-p` or `--previous`: **Dumps logs from the container instance that just crashed.**
+---
+
+#### **A. The Complete `kubectl logs` Master Reference**
+
+- **Under the Hood**: Kubelet acts as the streaming proxy. When you run `kubectl logs`, the API server connects to the node's Kubelet on port 10250. Kubelet reads directly from the container runtime log file located on the node filesystem at `/var/log/pods/<NAMESPACE>_<POD_NAME>_<POD_UID>/<CONTAINER_NAME>/<RESTART_COUNT>.log` (which is symlinked to `containerd`'s `/var/log/containers/`).
+- **All Flags & Parameters Explained**:
+  - `-c <CONTAINER_NAME>`: Specifies the exact container in a multi-container pod (e.g. `api-app` vs `cloud-sql-proxy`).
+  - `--all-containers=true`: Concurrently streams logs from every container inside the pod with container names prepended.
+  - `-l <LABEL_SELECTOR>`: Aggregates logs across multiple pods matching labels (e.g. `-l app=backend`).
+  - `-f` or `--follow`: Keeps the connection open, continuously streaming live log output as new lines are written.
+  - `--tail=<N>`: Displays only the most recent N lines (default: all lines, which can flood terminals in high-traffic apps).
+  - `-p` or `--previous`: **The #1 Crash Debugger.** Pulls logs from the *previously terminated container instance* before it crashed and rebooted.
+  - `--since=<DURATION>`: Filters logs generated within a specific timeframe (e.g. `--since=15m`, `--since=1h`, `--since=30s`).
+  - `--since-time=<TIMESTAMP>`: Filters logs generated after an exact RFC3339 timestamp (e.g. `--since-time=2026-08-14T10:00:00Z`).
+  - `--timestamps=true`: Prepends exact RFC3339 timestamps to each log line for precise correlation with database/firewall logs.
+  - `--limit-bytes=<N>`: Enforces a maximum byte threshold to prevent terminal buffer overflow.
+  - `--max-log-requests=<N>`: Sets the maximum number of concurrent logs streams when querying by label (default: 5).
+
+---
+
+#### **B. The Complete `kubectl get events` Master Reference**
+
+- **Under the Hood**: Kubernetes `Event` objects (`apiGroup: events.k8s.io/v1`) are transient state change records created by system controllers (`kube-scheduler`, `kubelet`, `node-controller`, `ingress-controller`, `hpa-controller`). Events are stored in `etcd` with an automatic **1-hour TTL eviction policy**.
+- **All Flags & Parameters Explained**:
+  - `-A` or `--all-namespaces`: Aggregates events across the entire cluster.
+  - `--sort-by='.metadata.creationTimestamp'`: **Essential.** Sorts events chronologically from oldest to newest.
+  - `--field-selector type=Warning`: Filters out routine `Normal` events to isolate critical cluster errors, node pressures, and probe failures.
+  - `--field-selector involvedObject.kind=Pod`: Filters events for a specific resource type (`Pod`, `Node`, `Service`, `Ingress`, `HPA`).
+  - `--field-selector involvedObject.name=<NAME>`: Isolates events affecting a single named resource.
+  - `-w` or `--watch`: Streams live cluster events as they happen.
+
+---
+
+#### **C. 12 Practical Real-World Scenarios: Logs & Events Debugging**
+
+##### **Scenario 1: Debugging `CrashLoopBackOff` (The Silent Fatal Crash)**
+- **Symptom**: Pod status cycles between `Running (0/2)` and `CrashLoopBackOff`.
+- **Command**:
+  ```bash
+  # 1. Fetch previous crash log before container rebooted
+  kubectl logs -l app=backend -c api-app --previous --tail=100
+
+  # 2. Check why Kubelet killed the container
+  kubectl get events --field-selector involvedObject.name=backend-deployment-78685646f4-qx7zs --sort-by='.metadata.creationTimestamp'
+  ```
+- **What to look for in output**: Uncaught Node.js exceptions (`Uncaught Error: Connection refused at 127.0.0.1:5432`), missing environment variables, or schema migration failures.
+
+---
+
+##### **Scenario 2: Diagnosing `OOMKilled` (Exit Code 137)**
+- **Symptom**: Pod restarts repeatedly. `kubectl get pods` shows `RESTARTS > 10`.
+- **Command**:
+  ```bash
+  # 1. Check container termination reason
+  kubectl describe pod -l app=backend | grep -E "State|Exit Code|Reason"
+
+  # 2. Check OOM kill event in cluster event stream
+  kubectl get events -A --field-selector type=Warning --sort-by='.metadata.creationTimestamp' | grep -i "OOM"
+  ```
+- **Expected Output**:
+  ```text
+  Last State: Terminated
+    Reason: OOMKilled
+    Exit Code: 137
+  ```
+- **Action**: Container memory exceeded `resources.limits.memory`. Increase memory limit or profile JavaScript heap usage.
+
+---
+
+##### **Scenario 3: Debugging Cloud SQL Proxy Sidecar TLS Handshake Failures**
+- **Symptom**: Node.js backend throws `ECONNREFUSED` or hangs when executing SQL queries.
+- **Command**:
+  ```bash
+  # Stream Cloud SQL Proxy sidecar logs with timestamps
+  kubectl logs -l app=backend -c cloud-sql-proxy --timestamps=true --tail=50 -f
+  ```
+- **What to look for in output**:
+  - `Ready for new connections`: Sidecar is healthy.
+  - `googleapi: Error 403: The client is not authorized`: Workload Identity missing `roles/cloudsql.client` on IAM Service Account.
+  - `instance connection name not found`: Typo in `PROJECT_ID:REGION:INSTANCE_NAME` argument.
+
+---
+
+##### **Scenario 4: Diagnosing `ImagePullBackOff` & `ErrImagePull`**
+- **Symptom**: Pod stuck in `ImagePullBackOff` or `ErrImagePull`.
+- **Command**:
+  ```bash
+  kubectl get events --field-selector type=Warning --sort-by='.metadata.creationTimestamp'
+  ```
+- **Expected Output in Events**:
+  ```text
+  Warning  Failed     32s   kubelet  Failed to pull image "us-east4-docker.pkg.dev/.../app-p2:latest": rpc error: code = Unknown desc = failed to pull and unpack image: failed to resolve reference: unexpected status code 403 Forbidden
+  ```
+- **Root Cause & Action**: Node Service Account (`sa-gke-nodes`) is missing `roles/artifactregistry.reader` permission, or the image tag does not exist.
+
+---
+
+##### **Scenario 5: Diagnosing Readiness Probe Failures (Service Removing Pods from Traffic)**
+- **Symptom**: Pod shows `Running (1/2)` or Service endpoints drop to `<none>`, causing HTTP 502.
+- **Command**:
+  ```bash
+  # 1. Check probe failure events
+  kubectl get events --field-selector reason=Unhealthy --sort-by='.metadata.creationTimestamp'
+
+  # 2. Check application server logs during probe window
+  kubectl logs -l app=backend -c api-app --since=5m --tail=50
+  ```
+- **Expected Output in Events**:
+  ```text
+  Warning  Unhealthy  12s (x6 over 42s)  kubelet  Readiness probe failed: HTTP probe failed with statuscode: 500
+  ```
+- **Action**: Pod is alive but `/health` route is returning 500 (e.g. database pool connection timed out).
+
+---
+
+##### **Scenario 6: Diagnosing Layer 7 Ingress & BackendConfig Health Check Failures**
+- **Symptom**: Public Ingress IP returns `HTTP 502 Bad Gateway`.
+- **Command**:
+  ```bash
+  # 1. Check Ingress Controller events
+  kubectl describe ingress gke-prod-ingress | grep -A 10 Events
+
+  # 2. Check Google Load Balancer backend health annotations
+  kubectl get ingress gke-prod-ingress -o jsonpath='{.metadata.annotations.ingress\.kubernetes\.io/backends}'
+  ```
+- **Expected Output**:
+  ```text
+  {"k8s1-ad76bf7b-default-frontend-service-80-a9fb50d3":"UNHEALTHY"}
+  ```
+- **Root Cause**: Nginx frontend is not responding with HTTP 200 on `/` to Google's Load Balancer health check probe IP ranges (`130.211.0.0/22`, `35.191.0.0/16`).
+
+---
+
+##### **Scenario 7: Diagnosing `FailedScheduling` (Resource Starvation)**
+- **Symptom**: Pod stays in `Status: Pending`.
+- **Command**:
+  ```bash
+  kubectl get events --field-selector reason=FailedScheduling --sort-by='.metadata.creationTimestamp'
+  ```
+- **Expected Output in Events**:
+  ```text
+  Warning  FailedScheduling  18s  default-scheduler  0/2 nodes are available: 2 Insufficient cpu, 2 Insufficient memory.
+  ```
+- **Action**: Cluster nodes have exhausted physical hardware. Scale up the GKE node pool or reduce `resources.requests.cpu` in Deployment YAML.
+
+---
+
+##### **Scenario 8: Multi-Container Parallel Log Streaming**
+- **Symptom**: Need to observe real-time interaction between `api-app` and `cloud-sql-proxy` sidecar simultaneously during live HTTP requests.
+- **Command**:
+  ```bash
+  # Stream both containers simultaneously with timestamps
+  kubectl logs -l app=backend --all-containers=true --timestamps=true -f --max-log-requests=10
+  ```
+
+---
+
+##### **Scenario 9: Correlating Application Timeouts with NetworkPolicy Dropped Packets**
+- **Symptom**: Frontend pod logs `ETIMEDOUT` when calling `http://backend-service:8080`.
+- **Command**:
+  ```bash
+  # 1. Check frontend pod logs for exact timeout timestamp
+  kubectl logs -l app=frontend --timestamps=true --tail=30
+
+  # 2. Check eBPF Dataplane V2 (Cilium) drop events in kube-system
+  kubectl get events -n kube-system --field-selector type=Warning --sort-by='.metadata.creationTimestamp'
+  ```
+- **Action**: NetworkPolicy `allow-tier2-backend` is blocking traffic because ingress port 8080 or pod label selectors are misconfigured.
+
+---
+
+##### **Scenario 10: Tracking Horizontal Pod Autoscaler (HPA) Scale-Up and Scale-Down Events**
+- **Symptom**: Need to audit when and why HPA triggered a replica expansion.
+- **Command**:
+  ```bash
+  kubectl get events --field-selector involvedObject.name=backend-hpa --sort-by='.metadata.creationTimestamp'
+  ```
+- **Expected Output in Events**:
+  ```text
+  Normal  SuccessfulRescale  2m   horizontal-pod-autoscaler  New size: 4; reason: cpu resource utilization (percentage of request) above target 70%
+  Normal  SuccessfulRescale  30s  horizontal-pod-autoscaler  New size: 2; reason: All metrics below target thresholds (stabilization window passed)
+  ```
+
+---
+
+##### **Scenario 11: Exporting Cluster Warning Events for Incident RCA Reports**
+- **Symptom**: Generating a post-mortem incident report after an outage.
+- **Command**:
+  ```bash
+  # Export all warning events from the last hour formatted in a clean table
+  kubectl get events -A \
+    --field-selector type=Warning \
+    --sort-by='.metadata.creationTimestamp' \
+    -o custom-columns=TIME:.metadata.creationTimestamp,NAMESPACE:.metadata.namespace,KIND:.involvedObject.kind,NAME:.involvedObject.name,REASON:.reason,MESSAGE:.message
+  ```
+
+---
+
+##### **Scenario 12: Live Streaming All System & Application Errors Simultaneously**
+- **Symptom**: Monitoring cluster health during a production release or chaos engineering test.
+- **Command**:
+  ```bash
+  # Watch all warning events stream across all namespaces in real time
+  kubectl get events -A --field-selector type=Warning -w
+  ```
+
+---
+
+#### **D. Interactive Debugging with `kubectl exec`**
+- **Under the Hood**: Instructs Kubelet to invoke `containerd` to spawn a process inside the container's PID, Mount, and Network namespaces.
 ```bash
-# Check Cloud SQL Auth Proxy sidecar logs
-kubectl logs -l app=backend -c cloud-sql-proxy --tail=50 -f
+# 1. Open interactive shell inside API container
+kubectl exec -it deployment/backend-deployment -c api-app -- /bin/sh
 
-# Check previous crash log
-kubectl logs <POD_NAME> -c api-app --previous
-```
-
-#### **`kubectl exec -it`**
-- **Under the Hood**: Instructs Kubelet to invoke `containerd` to spawn a process in the container's PID, Mount, and Network namespaces.
-```bash
-# Test internal database port reachability from API pod
+# 2. Test internal database port reachability from API pod over localhost
 kubectl exec -it deployment/backend-deployment -c api-app -- nc -zv 127.0.0.1 5432
+
+# 3. Test DNS resolution inside pod
+kubectl exec -it deployment/backend-deployment -c api-app -- nslookup backend-service
 ```
 
-#### **`kubectl port-forward`**
+---
+
+#### **E. Private Tunneling with `kubectl port-forward`**
 - **Under the Hood**: Opens a TCP listener on localhost, multiplexing streams across the API server tunnel directly to the container's network namespace.
 ```bash
-# Forward local port 8080 to internal backend Service
+# 1. Forward local port 8080 to internal backend Service
 kubectl port-forward svc/backend-service 8080:8080
+
+# 2. Forward local port 5432 to Cloud SQL Proxy inside a backend pod
+kubectl port-forward pod/backend-deployment-78685646f4-qx7zs 5432:5432
 ```
 
-#### **`kubectl top pods`**
-- **Under the Hood**: Fetches real-time CPU (in millicores `1m = 0.001 vCPU`) and memory usage from Metrics Server.
+---
+
+#### **F. Live Resource Metrics with `kubectl top`**
+- **Under the Hood**: Queries `metrics.k8s.io` to aggregate real-time hardware consumption.
 ```bash
-kubectl top pods --containers
+# 1. View live CPU & Memory usage per node
+kubectl top nodes --sort-by=cpu
+
+# 2. View live CPU & Memory usage per individual container
+kubectl top pods --containers --sort-by=memory
 ```
 
 ---
