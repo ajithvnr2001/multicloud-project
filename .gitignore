@@ -1,2 +1,20 @@
+# Dependencies
 node_modules/
-app/node_modules/
+*/node_modules/
+*/app/node_modules/
+package-lock.json
+
+# Terraform state & variables (sensitive credentials)
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
+.terraform/
+.terraform.lock.hcl
+state.json
+
+# Swap and OS files
+*.swp
+*.swo
+.DS_Store
+*.log

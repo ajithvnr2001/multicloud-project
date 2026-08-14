@@ -1,0 +1,60 @@
+steps:
+  - name: 'node:20-alpine'
+    entrypoint: 'npm'
+    args: ['install']
+    dir: 'app'
+    id: 'installations dev dependencies'
+
+  - name: 'node:20-alpine'
+    entrypoint: 'npm'
+    args: ['run', 'test']
+    dir: 'app'
+    id: 'running unit tests'
+
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - '$_GAR_REGION-docker.pkg.dev/$PROJECT_ID/$_GAR_REPO/app-p2:$_IMAGE_TAG'
+      - './app'
+    id: '1st step building container'
+
+  - name: 'aquasec/trivy:latest'
+    args:
+      - 'image'
+      - '--exit-code'
+      - '0'
+      - '--severity'
+      - 'CRITICAL'
+      - '$_GAR_REGION-docker.pkg.dev/$PROJECT_ID/$_GAR_REPO/app-p2:$_IMAGE_TAG'
+    id: 'scanning the build image'
+
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - '$_GAR_REGION-docker.pkg.dev/$PROJECT_ID/$_GAR_REPO/app-p2:$_IMAGE_TAG'
+    id: 'Push to Artifact Registry after scanning succedees'
+
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        gcloud container clusters get-credentials $_GKE_CLUSTER_NAME --zone ${_DEPLOY_REGION}-a --project $PROJECT_ID
+        kubectl set image deployment/backend-deployment api-app=$_GAR_REGION-docker.pkg.dev/$PROJECT_ID/$_GAR_REPO/app-p2:$_IMAGE_TAG --namespace=default
+        kubectl rollout status deployment/backend-deployment --namespace=default
+    id: 'this is to deploy rolling update to GKE'
+
+substitutions:
+  _GAR_REGION: 'us-east4'
+  _GAR_REPO: 'devops-portfolio'
+  _GKE_CLUSTER_NAME: 'gke-3tier-prod'
+  _DEPLOY_REGION: 'us-east4'
+  _IMAGE_TAG: 'latest'
+
+images:
+  - '$_GAR_REGION-docker.pkg.dev/$PROJECT_ID/$_GAR_REPO/app-p2:$_IMAGE_TAG'
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+
