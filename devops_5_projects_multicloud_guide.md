@@ -123,111 +123,107 @@ Health Check --> Traffic Live --> Rollback on Failure
 
 # PROJECT 2: IaC Kubernetes Cluster (Full Production-Grade 3-Tier Architecture)
 
+> **Implementation Note**: Complete working code, Terraform files, Kubernetes manifests, Cloud Build pipelines, and in-depth troubleshooting guides for Phase 2 are located in the [`phase2/`](./phase2/) directory.
+
 ## Goal
-Provision a production-grade managed Kubernetes cluster entirely via Terraform, deploy a genuine 3-tier application (Web/Presentation, Application/Logic, Data) with proper network segmentation, security boundaries, and high availability across GCP, AWS, and Azure.
+Provision a production-grade managed Kubernetes cluster entirely via Terraform, deploy a genuine 3-tier application (Web/Presentation, Application/Logic, Data) with proper network segmentation, security boundaries, and high availability across GCP (GKE Dataplane V2 / Cilium eBPF, Cloud SQL PostgreSQL, Workload Identity, and Cloud Armor Ingress), AWS (EKS), and Azure (AKS).
 
 ## The Classic 3-Tier Model (Network + Compute View)
 
 ```
-                              INTERNET
-                                 |
-                                 v
-                    +------------------------+
-                    |   CDN / WAF (edge)      |
-                    +------------------------+
-                                 |
-                                 v
-                 +-------------------------------+
-                 |  PUBLIC SUBNET (Tier 1: Web)   |
-                 |  - Load Balancer (L7)          |
-                 |  - Frontend pods / Web servers |
-                 |  - Auto Scaling Group / HPA    |
-                 +-------------------------------+
-                                 |
-                     (Private routing only)
-                                 v
-                 +-------------------------------+
-                 |  PRIVATE SUBNET (Tier 2: App)  |
-                 |  - Backend/API pods            |
-                 |  - Business logic, ClusterIP   |
-                 |  - Internal LB / Service Mesh  |
-                 +-------------------------------+
-                                 |
-                     (DB subnet, no internet route)
-                                 v
-                 +-------------------------------+
-                 |  DATA SUBNET (Tier 3: Database)|
-                 |  - Managed DB / StatefulSet     |
-                 |  - Multi-AZ replica, PV/PVC     |
-                 |  - No public IP, DB SG only     |
-                 +-------------------------------+
+                               INTERNET
+                                  |
+                                  v
+                     +------------------------+
+                     |   CDN / WAF (edge)     |
+                     |   (GCP Cloud Armor)    |
+                     +------------------------+
+                                  |
+                                  v
+                  +-------------------------------+
+                  |  PUBLIC SUBNET (Tier 1: Web)   |
+                  |  - Load Balancer (L7 Ingress)  |
+                  |  - Container-Native NEGs       |
+                  |  - Frontend pods / Nginx       |
+                  |  - BackendConfig / Drain 60s   |
+                  +-------------------------------+
+                                  |
+                      (Private routing only)
+                                  v
+                  +-------------------------------+
+                  |  PRIVATE SUBNET (Tier 2: App)  |
+                  |  - GKE Private Node Pool (COS) |
+                  |  - Node.js API pods (8080)     |
+                  |  - Cloud SQL Auth Proxy sidecar|
+                  |  - Workload Identity (IAM)     |
+                  |  - HPA Auto-Scaling (2-10 pods)|
+                  +-------------------------------+
+                                  |
+                      (Private Service Access / PSA VPC Peering)
+                                  v
+                  +-------------------------------+
+                  |  DATA SUBNET (Tier 3: Database)|
+                  |  - Managed Cloud SQL Postgres |
+                  |  - Private IP only (10.0.3.0)  |
+                  |  - No Public IP | Encrypted TLS|
+                  +-------------------------------+
 ```
 
 ## Cloud-Specific Production Mapping
 
-| Tier | GCP | AWS | Azure |
+| Tier | GCP (Phase 2 Implemented) | AWS | Azure |
 |---|---|---|---|
-| Edge/CDN/WAF | Cloud CDN + Cloud Armor | CloudFront + AWS WAF | Azure Front Door + WAF |
-| Tier 1 (Web/Public) | GKE pods in public-subnet-backed node pool, GCE Load Balancer | EC2/EKS pods in public subnet, ALB | AKS pods in public subnet, App Gateway |
-| Tier 2 (App/Private) | GKE pods in private node pool (no public IP), internal LB | EKS pods in private subnet, internal NLB | AKS pods in private subnet, internal LB |
-| Tier 3 (Data/Isolated) | Cloud SQL (private IP only) or StatefulSet + PD | RDS Multi-AZ (private subnet, no public access) or StatefulSet + EBS | Azure SQL/Postgres Flexible Server (private endpoint) or StatefulSet + Azure Disk |
-| Network segmentation | Separate subnets per tier in VPC, firewall rules by tag | Public/private/data subnets across AZs, Security Groups + NACLs per tier | VNet with subnets per tier, NSGs per subnet |
-| Tier-to-tier security | Firewall rule: Tier1->Tier2 only on app port; deny Tier1->Tier3 | SG: web-sg -> app-sg (port 8080); app-sg -> db-sg (port 5432); web-sg has NO route to db-sg | NSG: web-nsg -> app-nsg; app-nsg -> db-nsg; web-nsg blocked from db-nsg |
+| Edge/CDN/WAF | Cloud Armor WAF + Global HTTP(S) Load Balancer (`05-production-ingress.yaml`) | CloudFront + AWS WAF | Azure Front Door + WAF |
+| Tier 1 (Web/Presentation) | Nginx Pods with Container-Native NEGs, ClusterIP Service, `BackendConfig` | EC2/EKS pods in public subnet, ALB | AKS pods in public subnet, App Gateway |
+| Tier 2 (App/Logic) | Private GKE Node Pool (`n1-standard-1` in `us-east4-a`), Dataplane V2 eBPF NetworkPolicies, Workload Identity (`roles/iam.workloadIdentityUser`), Cloud SQL Proxy 2.x Sidecar | EKS pods in private subnet, internal NLB, IRSA | AKS pods in private subnet, internal LB, Workload Identity |
+| Tier 3 (Data/Isolated) | Cloud SQL PostgreSQL 15 via Private Service Access (PSA Peering), no public IP | RDS Multi-AZ (private subnet, no public access) or StatefulSet + EBS | Azure SQL/Postgres Flexible Server (private endpoint) or StatefulSet + Azure Disk |
+| Network segmentation | VPC-native secondary alias IPs (`gke-pods: 10.100.0.0/16`, `gke-services: 10.101.0.0/20`), Cloud NAT & Router | Public/private/data subnets across AZs, Security Groups + NACLs per tier | VNet with subnets per tier, NSGs per subnet |
+| Tier-to-tier security | eBPF NetworkPolicy: Tier 1 -> Tier 2 on 8080; Tier 2 -> Cloud SQL on 5432 & DNS on 53; deny all unauthorized traffic | SG: web-sg -> app-sg (port 8080); app-sg -> db-sg (port 5432); web-sg has NO route to db-sg | NSG: web-nsg -> app-nsg; app-nsg -> db-nsg; web-nsg blocked from db-nsg |
 
-## Phase-by-Phase Build (Updated for True 3-Tier)
+## Phase 2 Deliverables & File Layout
 
-### Phase 1: Network Foundation (3 Distinct Subnet Tiers)
-- Create VPC/VNet with THREE subnet tiers per AZ/zone: public (web), private-app, private-data
-- Route table: public subnet has route to Internet Gateway/NAT; app and data subnets do NOT have direct internet route
-- GCP: separate subnets with distinct secondary ranges, firewall rules keyed on network tags (`tier=web`, `tier=app`, `tier=data`)
-- AWS: public subnet (IGW route), private-app subnet (NAT Gateway route for egress only), private-data subnet (no NAT, no IGW)
-- Azure: subnet delegation per tier, NSG per subnet with explicit inbound/outbound rules
+All source code and manifests are organized under [`phase2/`](./phase2/):
 
-### Phase 2: Cluster Provisioning
-- Provision GKE/EKS/AKS with node pools split by tier: web node pool (can be public-facing), app node pool (private only), and if using StatefulSet DB, a dedicated data node pool
-- Enable Workload Identity / IRSA / Managed Identity scoped per tier's service account
+- **Terraform Infrastructure ([`phase2/terraform/`](./phase2/terraform/))**:
+  - `main.tf`, `variables.tf` (Region: `us-east4`, avoids stockouts & location policies).
+  - `vpc.tf` (VPC, Subnets, Cloud NAT & Router, Private Service Access).
+  - `gke.tf` (Private Cluster, Dataplane V2, `n1-standard-1` Node Pool, `deletion_protection = false`, `lifecycle` drift rules).
+  - `cloudsql.tf` (Private Cloud SQL PostgreSQL 15, `random_password`).
+  - `iam.tf` (GKE Node SA, Workload Identity Binding with `depends_on = [google_container_cluster.gke_cluster]`).
+  - `outputs.tf` (`gke_get_credentials_command`, `cloudsql_connection_name`, `db_password`).
+- **Kubernetes Manifests ([`phase2/k8s/`](./phase2/k8s/))**:
+  - `00-namespaces-rbac.yaml` (Workload Identity ServiceAccount).
+  - `01-network-policies.yaml` (eBPF micro-segmentation).
+  - `02-tier1-frontend.yaml` (Nginx + NEG + BackendConfig).
+  - `03-tier2-backend.yaml` (Multi-container Node.js API + Cloud SQL Proxy 2.8.1).
+  - `04-hpa-autoscaling.yaml` (HPA CPU > 70%, 2 to 10 replicas).
+  - `05-production-ingress.yaml` (Global L7 Load Balancer + BackendConfig).
+- **CI/CD Pipeline ([`phase2/cloudbuild.yaml`](./phase2/cloudbuild.yaml))**:
+  - Node.js test $\rightarrow$ Docker build $\rightarrow$ Trivy CVE scanning $\rightarrow$ Artifact Registry push $\rightarrow$ GKE rolling update.
+- **Deep-Dive Engineering Documentation**:
+  - [`phase2/project_2_gcp_guide.md`](./phase2/project_2_gcp_guide.md): Complete architecture guide and 9 break-and-learn test cases.
+  - [`phase2/triagephase2.md`](./phase2/triagephase2.md): Incident RCA on all 10 real errors, fixes, and senior interview questions.
+  - [`phase2/kubectl-commands-guide.md`](./phase2/kubectl-commands-guide.md): Exhaustive guide covering all 16 GKE default system pods/daemons, storage controllers, CRDs, and `kubectl` master reference.
 
-### Phase 3: Tier 1 — Web/Presentation Layer
-- Deploy frontend Deployment + HPA, expose via Ingress + external LoadBalancer/WAF
-- Enable CDN caching for static assets; TLS termination at the edge
-- Kubernetes NetworkPolicy: allow ingress from LB only, allow egress to Tier 2 only
-
-### Phase 4: Tier 2 — Application/Logic Layer
-- Deploy backend Deployment (business logic/API) in private subnet-backed nodes, exposed only via internal ClusterIP Service
-- NetworkPolicy: allow ingress from Tier 1 pods only (label selector), allow egress to Tier 3 only, deny all else
-- Configure HPA based on CPU/custom metrics; add readiness/liveness probes
-
-### Phase 5: Tier 3 — Data Layer
-- Option A (managed): Cloud SQL/RDS/Azure DB with private IP/private endpoint only, no public accessibility, automated backups, Multi-AZ/read replicas
-- Option B (self-managed): StatefulSet with PVC (SSD-backed storage class), headless Service for stable network identity, PodDisruptionBudget for HA
-- NetworkPolicy/SG/NSG: allow ingress from Tier 2 only, deny all other traffic including from Tier 1 entirely
-
-### Phase 6: Validation
-- Test that Tier 1 pods CANNOT directly reach Tier 3 (should time out) — this proves network segmentation actually works
-- Load test through the LB and confirm HPA scales Tier 1 and Tier 2 independently
-- Simulate an AZ/zone failure and confirm Tier 3 failover works (Multi-AZ RDS/Cloud SQL replica promotion)
-
-## Interview Questions & Debug Scenarios (3-Tier Specific)
+## Interview Questions & Debug Scenarios (3-Tier & GKE Specific)
 
 ### Conceptual
-- Why should the database tier never have a public IP or direct internet route, even if it's "just for testing"?
-- What's the difference between a Security Group (stateful) and a Network ACL (stateless) in AWS, and why use both?
-- Why deploy the app tier in a private subnet instead of the same public subnet as the web tier?
-- How does a Kubernetes NetworkPolicy achieve the same goal as subnet-level segmentation, and do you need both?
+- **Why use Workload Identity instead of mounting a GCP Service Account JSON key as a Kubernetes Secret?**
+  *Answer*: Static JSON keys never expire, risk exposure in Git/logs, and require manual key rotation. Workload Identity uses the local metadata server emulator (`gke-metadata-server`) to dynamically exchange KSA JWT tokens for short-lived (1-hour) OAuth 2.0 access tokens directly from Google STS.
+- **What is GKE Dataplane V2 (`ADVANCED_DATAPATH`) and why is it superior to `kube-proxy`?**
+  *Answer*: Dataplane V2 replaces `kube-proxy` iptables packet filtering with Cilium eBPF bytecode loaded into the Linux kernel. It provides $O(1)$ constant-time routing lookups (vs $O(N)$ linear degradation in iptables), direct Pod-to-Pod routing via Container-Native NEGs, and kernel-level NetworkPolicy enforcement.
+- **Why did Terraform fail with `Identity Pool does not exist (PROJECT_ID.svc.id.goog)` during cluster creation?**
+  *Answer*: The GCP Workload Identity Pool is created asynchronously by GCP only after the GKE control plane finishes provisioning. If the IAM binding runs in parallel, Google IAM rejects the call with HTTP 400. Solution: add an explicit `depends_on = [google_container_cluster.gke_cluster]` on the IAM resource.
 
 ### Scenario-Based
-- **Q:** The frontend can reach the backend, but the backend can't reach the database — how do you debug it?
-  **A:** Check DB security group/NSG inbound rules allow the app tier's SG/subnet CIDR on the DB port; check NetworkPolicy allows egress from app-tier pods to data-tier pods; verify DB isn't only listening on localhost/private-IP mismatch.
-- **Q:** During a security review, someone found the database tier reachable directly from the internet — what went wrong and how do you fix it permanently?
-  **A:** Likely the DB subnet was accidentally given a route to the Internet Gateway/NAT, or a public IP was assigned to the DB instance/LoadBalancer Service type was misconfigured as public. Fix: remove the public route, set Service type back to ClusterIP, audit all subnet route tables, add a policy-as-code check (Checkov/tfsec) to prevent recurrence.
-- **Q:** How do you scale the app tier independently from the web tier under load?
-  **A:** Separate HPA per Deployment (web HPA on request rate/CPU, app HPA on CPU or custom business metric like queue depth), separate node pools so scaling one tier doesn't starve the other.
-- **Q:** A teammate wants to let the web tier query the database "just this once" for a quick fix — how do you respond?
-  **A:** Reject it — this breaks tier isolation and the defense-in-depth model; the correct fix is adding a new endpoint/method in the app tier's API, even if slower, to preserve the security boundary.
-- **Q:** How would you migrate this 3-tier app from single-region to multi-region for DR while keeping tier isolation intact?
-  **A:** Replicate the full 3-subnet pattern per region, use global load balancing (Cloud Load Balancing / Route 53 / Traffic Manager) at Tier 1, async replication for Tier 3 (cross-region read replica), and keep Tier 2 stateless so it can scale in any region without data sync issues.
-- **Q:** Explain the full request path end-to-end for a scenario question: "User submits a form and the request eventually fails."
-  **A:** Walk it tier by tier: CDN/WAF (check WAF didn't block the request) -> LB (check health checks/target group) -> Tier 1 pod (check logs/readiness) -> Tier 2 pod via ClusterIP (check NetworkPolicy allows this path, check app logs for exceptions) -> Tier 3 DB (check connection pool exhaustion, check SG/NSG allows Tier 2 CIDR) -> trace the failure to the exact tier using this same layered approach.
+- **Q:** Your cluster creation fails with `GCE_STOCKOUT` in `us-central1`. How do you recover?
+  **A:** Stockouts occur when GCP data centers exhaust physical compute allocations for a machine family (e.g. `e2`). Remediate by shifting to an enterprise hardware family (e.g. `n1-standard-1`) or relocating to an alternative compliant region (e.g. `us-east4`).
+- **Q:** When destroying infrastructure, `google_service_networking_connection` fails with `Producer services are still using this connection`.
+  **A:** Cloud SQL Private Service Access (PSA) VPC Peering retains internal tenant network interfaces in a tombstone state for 5–15 minutes after database deletion. Remove the resource from Terraform state (`terraform state rm`) and clean up the VPC via `gcloud`.
+- **Q:** How do Pod Auto-Scaling (HPA) and Node Auto-Scaling (Cluster Autoscaler) interact under traffic load?
+  **A:** When incoming traffic drives CPU $> 70\%$, HPA scales pods from 2 to 10. When the existing 2 nodes run out of CPU/RAM to host the new pods, pods enter `Status: Pending`. The GKE Cluster Autoscaler detects pending pods and calls Compute Engine API to boot up Node #3 (up to `max_node_count = 5`).
+- **Q:** A `kubectl describe pod` shows Exit Code 137. What happened?
+  **A:** Exit Code 137 indicates the pod was **OOMKilled** by the Linux kernel because container memory usage exceeded `resources.limits.memory`. Fix: increase memory limit or fix memory leaks in the Node.js application.
 
 # PROJECT 3: GitOps Microservices with ArgoCD
 
