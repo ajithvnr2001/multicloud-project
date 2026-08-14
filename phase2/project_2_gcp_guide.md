@@ -354,29 +354,7 @@ options:
 
 ### B. Infrastructure as Code (Terraform)
 
-#### File: `project-2/terraform/main.tf`
-```hcl
-terraform {
-  required_version = ">= 1.5.0"
-  required_providers {
-    google = {
-      source  = "hashicorp/google"
-      version = "~> 5.30.0"
-    }
-    kubernetes = {
-      source  = "hashicorp/kubernetes"
-      version = "~> 2.30.0"
-    }
-  }
-}
-
-provider "google" {
-  project = var.project_id
-  region  = var.region
-}
-```
-
-#### File: `project-2/terraform/variables.tf`
+#### File: `phase2/terraform/variables.tf`
 ```hcl
 variable "project_id" {
   description = "GCP Project ID"
@@ -386,7 +364,7 @@ variable "project_id" {
 variable "region" {
   description = "GCP Region for resources"
   type        = string
-  default     = "us-central1"
+  default     = "us-east4"
 }
 
 variable "cluster_name" {
@@ -402,25 +380,26 @@ variable "authorized_ipv4_cidr" {
 }
 ```
 
-#### File: `project-2/terraform/vpc.tf`
+#### File: `phase2/terraform/vpc.tf`
 ```hcl
-# VPC Network
+# VPC Network for 3-Tier Production Architecture
 resource "google_compute_network" "vpc" {
   name                    = "vpc-3tier-prod"
   auto_create_subnetworks = false
+  routing_mode            = "REGIONAL"
 }
 
-# Subnet Tier 1: Web / Ingress
+# Tier 1: Public / Web Subnet
 resource "google_compute_subnetwork" "web_subnet" {
-  name          = "sb-web-us-central1"
+  name          = "sb-web-us-east4"
   ip_cidr_range = "10.0.1.0/24"
   region        = var.region
   network       = google_compute_network.vpc.id
 }
 
-# Subnet Tier 2: App / GKE Private Nodes
+# Tier 2: Private / App Subnet (VPC-Native GKE Cluster)
 resource "google_compute_subnetwork" "app_subnet" {
-  name                     = "sb-app-us-central1"
+  name                     = "sb-app-us-east4"
   ip_cidr_range            = "10.0.2.0/24"
   region                   = var.region
   network                  = google_compute_network.vpc.id
@@ -465,15 +444,16 @@ resource "google_compute_global_address" "private_ip_alloc" {
 resource "google_service_networking_connection" "private_vpc_connection" {
   network                 = google_compute_network.vpc.id
   service                 = "servicenetworking.googleapis.com"
-  reserved_peered_ranges = [google_compute_global_address.private_ip_alloc.name]
+  reserved_peering_ranges = [google_compute_global_address.private_ip_alloc.name]
 }
 ```
 
-#### File: `project-2/terraform/gke.tf`
+#### File: `phase2/terraform/gke.tf`
 ```hcl
 resource "google_container_cluster" "gke_cluster" {
-  name     = var.cluster_name
-  location = var.region
+  name                = var.cluster_name
+  location            = "${var.region}-a"
+  deletion_protection = false
 
   remove_default_node_pool = true
   initial_node_count       = 1
@@ -641,17 +621,19 @@ resource "google_service_account_iam_member" "workload_identity_binding" {
   service_account_id = google_service_account.app_workload_sa.name
   role               = "roles/iam.workloadIdentityUser"
   member             = "serviceAccount:${var.project_id}.svc.id.goog[default/ksa-app-backend]"
+
+  depends_on = [google_container_cluster.gke_cluster]
 }
 ```
 
-#### File: `project-2/terraform/outputs.tf`
+#### File: `phase2/terraform/outputs.tf`
 ```hcl
 output "gke_cluster_name" {
   value = google_container_cluster.gke_cluster.name
 }
 
 output "gke_get_credentials_command" {
-  value = "gcloud container clusters get-credentials ${google_container_cluster.gke_cluster.name} --region ${var.region} --project ${var.project_id}"
+  value = "gcloud container clusters get-credentials ${google_container_cluster.gke_cluster.name} --zone ${var.region}-a --project ${var.project_id}"
 }
 
 output "cloudsql_private_ip" {
@@ -933,7 +915,7 @@ spec:
       targetPort: 8080
 ```
 
-#### File: `project-2/k8s/04-hpa-autoscaling.yaml`
+#### File: `phase2/k8s/04-hpa-autoscaling.yaml`
 ```yaml
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
@@ -956,6 +938,47 @@ spec:
           averageUtilization: 70
 ```
 
+#### File: `phase2/k8s/05-production-ingress.yaml`
+```yaml
+apiVersion: cloud.google.com/v1
+kind: BackendConfig
+metadata:
+  name: frontend-backend-config
+  namespace: default
+spec:
+  timeoutSec: 40
+  connectionDraining:
+    drainingTimeoutSec: 60
+  logging:
+    enable: true
+    sampleRate: 1.0
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: gke-prod-ingress
+  namespace: default
+  annotations:
+    kubernetes.io/ingress.class: "gce"
+    kubernetes.io/ingress.global-static-ip-name: "gke-frontend-static-ip"
+spec:
+  defaultBackend:
+    service:
+      name: frontend-service
+      port:
+        number: 80
+  rules:
+    - http:
+        paths:
+          - path: /*
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: frontend-service
+                port:
+                  number: 80
+```
+
 ---
 
 ## 5. End-to-End Implementation & Execution Steps
@@ -963,7 +986,7 @@ spec:
 ### Step 1: Initialize GCP Environment & Enable APIs
 ```bash
 export PROJECT_ID=$(gcloud config get-value project)
-export REGION="us-central1"
+export REGION="us-east4"
 export REPO_NAME="devops-portfolio"
 
 gcloud services enable \
