@@ -27,6 +27,15 @@
    - [3.9 Auto-Scaling (HPA) & Resource Governance](#39-auto-scaling-hpa--resource-governance)
    - [3.10 Advanced JSONPath & Custom Columns](#310-advanced-jsonpath--custom-columns)
 4. [Master Production Triage Matrix](#4-master-production-triage-matrix)
+5. [Multi-Cloud Companion: AWS EKS Core System Pods, Daemons & Equivalents](#5-multi-cloud-companion-aws-eks-core-system-pods-daemons--equivalents)
+6. [Hands-On "Get Dirty" Command Mastery & Production Playground](#6-hands-on-get-dirty-command-mastery--production-playground)
+   - [Level 1: Cluster Identity & Context Switching](#level-1-cluster-identity--context-switching)
+   - [Level 2: Worker Node Topology & Resource Reservation](#level-2-worker-node-topology--resource-reservation)
+   - [Level 3: Multi-Container Pod Introspection](#level-3-multi-container-pod-introspection)
+   - [Level 4: Live Container Shells, Local Socket Probes & Port-Forwarding](#level-4-live-container-shells-local-socket-probes--port-forwarding)
+   - [Level 5: Real-Time Log Streaming, Crash Dumps & Cluster Event Auditing](#level-5-real-time-log-streaming-crash-dumps--cluster-event-auditing)
+   - [Level 6: Advanced JSONPath Expressions & Custom Terminal Dashboards](#level-6-advanced-jsonpath-expressions--custom-terminal-dashboards)
+   - [Level 7: Production Chaos, Zero-Downtime Rollouts & HPA Load Testing](#level-7-production-chaos-zero-downtime-rollouts--hpa-load-testing)
 
 ---
 
@@ -739,4 +748,191 @@ kubectl logs -n kube-system -l app=ebs-csi-node -c ebs-plugin --tail=50
 # 5. Verify IRSA / IAM Role annotation on Kubernetes Service Account in AWS
 kubectl describe sa ksa-app-backend | grep -i "eks.amazonaws.com/role-arn"
 ```
+
+---
+
+# 6. Hands-On "Get Dirty" Command Mastery & Production Playground
+
+This section provides an actionable, interactive command reference arranged progressively from core cluster introspection to live chaos engineering. **Every single command, flag, parameter, and output value is explained in depth.**
+
+---
+
+### Level 1: Cluster Identity & Context Switching
+
+#### **1. `kubectl config current-context`**
+- **Syntax**: `kubectl config current-context`
+- **Explanation**: Reads `~/.kube/config` and prints the active cluster context name (e.g. `gke_practice-502506_us-east4-a_gke-3tier-prod`).
+- **Why use it**: Run this before any write operation (`apply`, `delete`) to ensure you are targeting the intended cluster.
+
+#### **2. `kubectl config get-contexts`**
+- **Syntax**: `kubectl config get-contexts`
+- **Explanation**: Lists all registered clusters, user authentication tokens, and namespaces, highlighting the active cluster with `*`.
+
+#### **3. `kubectl config view --minify --raw`**
+- **Syntax**: `kubectl config view --minify --raw`
+- **Explanation**: `--minify` filters the output to only the active cluster. `--raw` prevents redaction of base64 client certificates (`client-certificate-data`) and Bearer tokens.
+- **Why use it**: Extract raw cluster CA certificates and API server hostnames when writing automation scripts or configuring external CI/CD pipelines.
+
+#### **4. `kubectl cluster-info`**
+- **Syntax**: `kubectl cluster-info`
+- **Explanation**: Queries `GET /api` on the control plane and returns the live URLs of the Kubernetes Master and core cluster services (CoreDNS, KubeDNS).
+
+#### **5. `kubectl api-resources`**
+- **Syntax**: `kubectl api-resources [-o wide]`
+- **Explanation**: Queries the API server's OpenAPI schema and outputs a complete list of all supported resource kinds, their short names (e.g., `po` for pods, `svc` for services, `netpol` for networkpolicies, `hpa` for horizontalpodautoscalers), API groups (`apps/v1`, `networking.k8s.io/v1`), and whether the resource is namespaced or cluster-scoped.
+
+---
+
+### Level 2: Worker Node Topology & Resource Reservation
+
+#### **1. `kubectl get nodes -o wide`**
+- **Syntax**: `kubectl get nodes -o wide`
+- **Explanation**: Retrieves all worker nodes. `-o wide` displays `INTERNAL-IP` (VPC private IP), `OS-IMAGE` (e.g. Container-Optimized OS), `KERNEL-VERSION` (e.g. `6.12.85+`), and `CONTAINER-RUNTIME` (`containerd://2.x`).
+
+#### **2. `kubectl get nodes --show-labels`**
+- **Syntax**: `kubectl get nodes --show-labels`
+- **Explanation**: Dumps all key-value labels assigned to nodes (e.g., `topology.gke.io/zone=us-east4-a`, `node.kubernetes.io/instance-type=n1-standard-1`). Used for `nodeSelector` and `nodeAffinity` scheduling rules.
+
+#### **3. `kubectl top nodes --sort-by=cpu`**
+- **Syntax**: `kubectl top nodes --sort-by=cpu`
+- **Explanation**: Fetches live compute consumption from Metrics Server. Lists CPU (millicores `m`, where $1000\text{m} = 1\text{ vCPU}$) and RAM (MiB / GiB) per node, sorted from highest consumer to lowest.
+
+#### **4. `kubectl describe node <NODE_NAME>`**
+- **Syntax**: `kubectl describe node <NODE_NAME>`
+- **Explanation**: Deep-dives into node health:
+  - `Allocatable`: Actual capacity available for user pods after subtracting GKE system reservations (`kube-reserved` and `system-reserved`).
+  - `Conditions`: Checks `Ready=True`, `MemoryPressure=False`, `DiskPressure=False`, `PIDPressure=False`.
+  - `Non-terminated Pods`: Displays the total sum of CPU and memory `requests` and `limits` reserved by active pods on that node.
+
+---
+
+### Level 3: Multi-Container Pod Introspection
+
+#### **1. `kubectl get pods -o wide`**
+- **Syntax**: `kubectl get pods [-n <NAMESPACE>] -o wide`
+- **Explanation**: Shows Pod IP addresses (`10.100.x.x` secondary VPC range) and the exact worker VM node (`spec.nodeName`) hosting each pod.
+
+#### **2. `kubectl get pods -l tier=tier2`**
+- **Syntax**: `kubectl get pods -l <KEY>=<VALUE>`
+- **Explanation**: Uses label selectors to filter pods. Essential when scripting rolling deployments or checking specific microservice tiers.
+
+#### **3. `kubectl describe pod <POD_NAME>`**
+- **Syntax**: `kubectl describe pod <POD_NAME>`
+- **Explanation**: The primary pod diagnostic tool. Inspects:
+  - `Init Containers` and `Containers` state (`Waiting`, `Running`, `Terminated`).
+  - `Exit Codes`: `0` (clean exit), `1` (application crash), `137` (OOMKilled by Linux kernel), `139` (Segmentation fault).
+  - `Events:` chronological audit trail of scheduling, volume mounts, image pulls, and probe failures.
+
+#### **4. `kubectl get pod <POD_NAME> -o jsonpath='{.spec.containers[*].name}'`**
+- **Syntax**: `kubectl get pod <POD_NAME> -o jsonpath='<EXPRESSION>'`
+- **Explanation**: Extracts specific JSON attributes. This command lists all container names running inside a multi-container pod (e.g. `api-app cloud-sql-proxy`).
+
+---
+
+### Level 4: Live Container Shells, Local Socket Probes & Port-Forwarding
+
+#### **1. `kubectl exec -it <POD_NAME> -c <CONTAINER> -- /bin/sh`**
+- **Syntax**: `kubectl exec -it <POD_NAME> -c <CONTAINER> -- /bin/sh`
+- **Explanation**: Allocates a pseudo-TTY (`-t`) and keeps stdin open (`-i`) to launch an interactive shell inside the container's isolated Linux namespace.
+- **Why use it**: Inspect `/etc/resolv.conf`, verify environment variables (`env`), and test local file permissions.
+
+#### **2. `kubectl exec -it <POD_NAME> -c api-app -- nc -zv 127.0.0.1 5432`**
+- **Syntax**: `kubectl exec -it <POD_NAME> -c <CONTAINER> -- nc -zv <HOST> <PORT>`
+- **Explanation**: Uses Netcat (`nc`) with zero-I/O mode (`-z`) and verbose output (`-v`) to test if the Cloud SQL Proxy sidecar is actively listening on TCP port 5432 over `127.0.0.1` (localhost).
+
+#### **3. `kubectl exec -it <POD_NAME> -c api-app -- nslookup backend-service`**
+- **Syntax**: `kubectl exec -it <POD_NAME> -c <CONTAINER> -- nslookup <SERVICE_NAME>`
+- **Explanation**: Tests internal Kubernetes DNS service discovery by querying `node-local-dns` (`169.254.20.10`) or `kube-dns` to verify that service names resolve to their virtual ClusterIPs (`10.101.x.x`).
+
+#### **4. `kubectl port-forward svc/backend-service 8080:8080`**
+- **Syntax**: `kubectl port-forward <RESOURCE_TYPE>/<NAME> <LOCAL_PORT>:<REMOTE_PORT>`
+- **Explanation**: Opens a local TCP listener on port 8080 and establishes a multiplexed SPDY tunnel through the Kubernetes API server directly into the private ClusterIP service.
+- **Why use it**: Test private APIs or database endpoints from your local browser or `curl` without exposing public Load Balancers.
+
+---
+
+### Level 5: Real-Time Log Streaming, Crash Dumps & Cluster Event Auditing
+
+#### **1. `kubectl logs -l app=backend -c cloud-sql-proxy --timestamps=true --tail=30 -f`**
+- **Syntax**: `kubectl logs -l <SELECTOR> -c <CONTAINER> --timestamps=true --tail=<N> -f`
+- **Explanation**: Streams logs across all pods matching `app=backend`, targeting only the `cloud-sql-proxy` sidecar container. `--timestamps=true` prepends RFC3339 timestamps for log correlation. `-f` follows the live stream.
+
+#### **2. `kubectl logs <POD_NAME> -c api-app --previous`**
+- **Syntax**: `kubectl logs <POD_NAME> -c <CONTAINER> --previous`
+- **Explanation**: Pulls the log buffer of the **previously terminated container instance** before it crashed. **Essential for debugging `CrashLoopBackOff`.**
+
+#### **3. `kubectl get events --sort-by='.metadata.creationTimestamp'`**
+- **Syntax**: `kubectl get events --sort-by='<JSONPATH>'`
+- **Explanation**: Retrieves all cluster state change records stored in `etcd` sorted chronologically from oldest to newest.
+
+#### **4. `kubectl get events -A --field-selector type=Warning`**
+- **Syntax**: `kubectl get events -A --field-selector type=Warning`
+- **Explanation**: Scans all namespaces (`-A`) and filters out routine `Normal` events to isolate critical warnings: `FailedScheduling`, `Unhealthy` probe failures, `FailedMount`, and `OOMKilling`.
+
+---
+
+### Level 6: Advanced JSONPath Expressions & Custom Terminal Dashboards
+
+#### **1. `kubectl get ingress gke-prod-ingress -o jsonpath='{.status.loadBalancer.ingress[0].ip}'`**
+- **Syntax**: `kubectl get <RESOURCE> -o jsonpath='<QUERY>'`
+- **Explanation**: Navigates the JSON object tree and extracts only the assigned external IPv4 address of the Google Cloud Global Application Load Balancer.
+
+#### **2. `kubectl get secret db-credentials -o jsonpath="{.data.password}" | base64 --decode`**
+- **Syntax**: `kubectl get secret <NAME> -o jsonpath="{.data.<KEY>}" | base64 --decode`
+- **Explanation**: Extracts the base64-encoded secret payload from `etcd` and pipes it directly to `base64 --decode` to view the plaintext database password.
+
+#### **3. `kubectl get pods -o custom-columns=...`**
+- **Syntax**: `kubectl get pods -o custom-columns=<COL_NAME>:<JSONPATH>,...`
+- **Explanation**: Builds custom terminal dashboards on the fly:
+  ```bash
+  kubectl get pods -o custom-columns=POD_NAME:.metadata.name,CPU_REQUEST:.spec.containers[*].resources.requests.cpu,MEM_LIMIT:.spec.containers[*].resources.limits.memory,RESTARTS:.status.containerStatuses[*].restartCount,STATUS:.status.phase
+  ```
+
+---
+
+### Level 7: Production Chaos, Zero-Downtime Rollouts & HPA Load Testing
+
+#### **1. Zero-Downtime Rolling Update & Rollback**
+```bash
+# 1. Update container image imperatively
+kubectl set image deployment/frontend-deployment nginx-frontend=nginx:1.25.4-alpine
+
+# 2. Watch rolling update progression across ReplicaSets
+kubectl rollout status deployment/frontend-deployment
+
+# 3. View deployment revision history
+kubectl rollout history deployment/frontend-deployment
+
+# 4. Instant rollback to previous revision
+kubectl rollout undo deployment/frontend-deployment
+```
+- **Under the Hood**: Kubernetes creates a new ReplicaSet (`v2`), provisions new pods, waits for their `readinessProbe` to pass, adds them to the Service Endpoints, and only then terminates pods in the old ReplicaSet (`v1`).
+
+#### **2. Pod Deletion & ReplicaSet Self-Healing**
+```bash
+# Delete a running pod to test self-healing
+TARGET_POD=$(kubectl get pods -l app=backend -o jsonpath='{.items[0].metadata.name}')
+kubectl delete pod $TARGET_POD
+```
+- **Under the Hood**: The `kube-controller-manager` runs an infinite control loop ($T_{\text{reconcile}} \approx 100\text{ms}$). When `observedReplicas` ($1$) $<$ `desiredReplicas` ($2$), it immediately issues a `POST /api/v1/pods` request to schedule a replacement pod.
+
+#### **3. Horizontal Pod Autoscaler (HPA) Real-Time Stress Testing**
+```bash
+# 1. Watch HPA metrics in real time
+kubectl get hpa backend-hpa -w &
+
+# 2. Launch 4 parallel authorized stress worker pods (tagged with tier=tier1 to pass NetworkPolicies)
+for i in {1..4}; do
+  kubectl run stress-worker-$i \
+    --image=curlimages/curl:latest \
+    --labels="app=frontend,tier=tier1" \
+    --restart=Never \
+    -- /bin/sh -c "while true; do curl -s http://backend-service:8080/health > /dev/null; done"
+done
+
+# 3. Clean up stress workers after scale-up is observed
+kubectl delete pod stress-worker-1 stress-worker-2 stress-worker-3 stress-worker-4
+```
+- **Under the Hood**: Every 15 seconds, HPA queries `metrics-server` for CPU usage. When average CPU exceeds 70%, HPA calculates desired replicas ($\lceil \text{Current} \times \frac{\text{Observed\%}}{\text{Target\%}} \rceil$) and updates the Deployment replica count from 2 up to 10.
+
 
