@@ -1077,6 +1077,13 @@ kubectl exec -it $FRONTEND_POD -- nc -zv -w 3 $CLOUDSQL_IP 5432 || echo "Tier 1 
 
 Use these 11 interactive debugging scenarios to simulate real-world GKE production incidents, observe failure symptoms, and master root-cause resolution.
 
+```bash
+# Helper: Export common variables for the lab
+export PROJECT_ID=$(gcloud config get-value project)
+export REGION="us-east4"
+export ZONE="us-east4-a"
+```
+
 ---
 
 ### Case 1: Workload Identity IAM Binding & Placeholder Mismatch
@@ -1084,39 +1091,77 @@ Use these 11 interactive debugging scenarios to simulate real-world GKE producti
 > **Interview Context:** "Your application pod deploys and runs, but the Cloud SQL Auth Proxy sidecar crashes continuously with `google: could not find default credentials` or `403 Forbidden` on the Cloud SQL API."
 
 * **How to Break:**
-  1. Overwrite the ServiceAccount annotation with an un-substituted placeholder string:
-     ```bash
-     kubectl annotate serviceaccount ksa-app-backend --overwrite \
-       iam.gke.io/gcp-service-account="sa-app-backend@PROJECT_ID.iam.gserviceaccount.com"
-     ```
-  2. Or delete the Workload Identity IAM policy binding on GCP IAM:
-     ```bash
-     gcloud iam service-accounts remove-iam-policy-binding \
-       sa-app-backend@$PROJECT_ID.iam.gserviceaccount.com \
-       --role="roles/iam.workloadIdentityUser" \
-       --member="serviceAccount:$PROJECT_ID.svc.id.goog[default/ksa-app-backend]"
-     ```
-* **The Symptoms:**
-  `kubectl logs` on the `cloud-sql-proxy` container shows:
-  ```text
-  critical: option error: failed to authorize: google: could not find default credentials. 
-  The proxy has encountered a terminal error: unable to start: error initializing dialer: failed to create token source
-  ```
-  The pod enters `CrashLoopBackOff` with `1/2 READY`.
-* **The Learn:**
-  Without the `roles/iam.workloadIdentityUser` IAM binding and a matching `iam.gke.io/gcp-service-account` annotation with the real project ID, the GKE Metadata Server rejects token exchange attempts from the KSA. The pod fails to receive Google Application Default Credentials (ADC).
-* **How to Fix:**
-  Set the real project ID in the KSA annotation and re-grant the IAM binding:
   ```bash
+  # Scenario A: Overwrite KSA annotation with an un-substituted template placeholder
   kubectl annotate serviceaccount ksa-app-backend --overwrite \
-    iam.gke.io/gcp-service-account="sa-app-backend@$PROJECT_ID.iam.gserviceaccount.com"
-  
-  gcloud iam service-accounts add-iam-policy-binding \
-    sa-app-backend@$PROJECT_ID.iam.gserviceaccount.com \
-    --role="roles/iam.workloadIdentityUser" \
-    --member="serviceAccount:$PROJECT_ID.svc.id.goog[default/ksa-app-backend]"
-  
+    iam.gke.io/gcp-service-account="sa-app-backend@PROJECT_ID.iam.gserviceaccount.com"
+
+  # Trigger pod restart to flush cached tokens
   kubectl rollout restart deployment backend-deployment
+  ```
+  *(Or Scenario B: Remove the GCP IAM Workload Identity binding)*
+  ```bash
+  gcloud iam service-accounts remove-iam-policy-binding \
+    sa-app-backend@${PROJECT_ID}.iam.gserviceaccount.com \
+    --role="roles/iam.workloadIdentityUser" \
+    --member="serviceAccount:${PROJECT_ID}.svc.id.goog[default/ksa-app-backend]"
+  ```
+
+* **What to Check & Diagnostic Commands:**
+  1. **Check Pod Ready Status & Restarts:**
+     ```bash
+     kubectl get pods -l app=backend
+     # Expected Output: STATUS: CrashLoopBackOff | READY: 1/2 | RESTARTS: >= 1
+     ```
+  2. **Inspect Container Status Details:**
+     ```bash
+     kubectl get pod -l app=backend -o jsonpath='{range .items[*].status.containerStatuses[*]}{.name}{"\tReady: "}{.ready}{"\tRestarts: "}{.restartCount}{"\tState: "}{.state}{"\n"}{end}'
+     # Expected Output: cloud-sql-proxy Ready: false, waiting (CrashLoopBackOff)
+     ```
+  3. **Read Crash Logs from Previous Container Run:**
+     ```bash
+     BACKEND_POD=$(kubectl get pods -l app=backend -o jsonpath='{.items[0].metadata.name}')
+     kubectl logs $BACKEND_POD -c cloud-sql-proxy --previous --tail=30
+     ```
+     *Expected Error Signature:*
+     ```text
+     {"severity":"INFO","message":"Authorizing with Application Default Credentials"}
+     {"severity":"ERROR","message":"The proxy has encountered a terminal error: unable to start: error initializing dialer: failed to create token source: google: could not find default credentials."}
+     ```
+  4. **Verify ServiceAccount Annotation & IAM Policy:**
+     ```bash
+     # Check live KSA annotation
+     kubectl get sa ksa-app-backend -o yaml | grep iam.gke.io
+     # Notice literal "PROJECT_ID" instead of real project ID!
+
+     # Check GCP IAM Policy Binding
+     gcloud iam service-accounts get-iam-policy sa-app-backend@${PROJECT_ID}.iam.gserviceaccount.com
+     ```
+
+* **The Learn (Root Cause Analysis):**
+  Without the `roles/iam.workloadIdentityUser` IAM binding and a valid `iam.gke.io/gcp-service-account` annotation containing the real GCP project ID, the GKE Metadata Server emulator rejects token exchange attempts from the KSA. The sidecar fails to receive Google Application Default Credentials (ADC) and crashes immediately with Exit Code 1.
+
+* **How to Fix:**
+  ```bash
+  # 1. Update KSA annotation with real GCP project ID
+  kubectl annotate serviceaccount ksa-app-backend --overwrite \
+    iam.gke.io/gcp-service-account="sa-app-backend@${PROJECT_ID}.iam.gserviceaccount.com"
+
+  # 2. Ensure GCP IAM Workload Identity user binding exists
+  gcloud iam service-accounts add-iam-policy-binding \
+    sa-app-backend@${PROJECT_ID}.iam.gserviceaccount.com \
+    --role="roles/iam.workloadIdentityUser" \
+    --member="serviceAccount:${PROJECT_ID}.svc.id.goog[default/ksa-app-backend]"
+
+  # 3. Rollout restart the deployment
+  kubectl rollout restart deployment backend-deployment
+  ```
+
+* **Verification (How to Confirm Success):**
+  ```bash
+  kubectl rollout status deployment backend-deployment
+  kubectl get pods -l app=backend
+  # Expected: READY 2/2 | STATUS Running | RESTARTS 0
   ```
 
 ---
@@ -1126,28 +1171,65 @@ Use these 11 interactive debugging scenarios to simulate real-world GKE producti
 > **Interview Context:** "Frontend pods return `504 Gateway Timeout` when making API requests to the backend service. Both sets of pods are reported as `Running`. Where is the failure?"
 
 * **How to Break:**
-  Modify `01-network-policies.yaml` to change the allowed port in `allow-tier1-frontend` egress from `8080` to `9090`, then apply it:
+  Modify `01-network-policies.yaml` to change the allowed egress port in `allow-tier1-frontend` from `8080` to `9090`, then apply it:
   ```yaml
-  # Wrong port breaking egress traffic
-  ports:
-    - protocol: TCP
-      port: 9090
+  # In 01-network-policies.yaml -> allow-tier1-frontend
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: backend
+              tier: tier2
+      ports:
+        - protocol: TCP
+          port: 9090 # Wrong port breaking Tier 1 -> Tier 2 traffic
   ```
-* **The Symptoms:**
-  Executing an HTTP request from inside the frontend pod times out:
   ```bash
-  FRONTEND_POD=$(kubectl get pods -l app=frontend -o jsonpath='{.items[0].metadata.name}')
-  kubectl exec -it $FRONTEND_POD -- wget -T 5 -qO- http://backend-service:8080/health
-  # Result: wget: download timed out
+  kubectl apply -f phase2/k8s/01-network-policies.yaml
   ```
-* **The Learn:**
-  GKE Dataplane V2 (eBPF) enforces strict egress policies at the kernel level. If a packet's destination pod label or port does not match an explicit `egress` rule in the source pod's NetworkPolicy, the kernel silently drops the packet without sending a TCP RST.
+
+* **What to Check & Diagnostic Commands:**
+  1. **Check Pod Health (Both appear deceptively healthy!):**
+     ```bash
+     kubectl get pods -o wide
+     # Both frontend and backend show Running (1/1 and 2/2)
+     ```
+  2. **Execute Inter-Tier HTTP Request from Frontend Pod:**
+     ```bash
+     FRONTEND_POD=$(kubectl get pods -l app=frontend -o jsonpath='{.items[0].metadata.name}')
+     kubectl exec -it $FRONTEND_POD -- wget -T 5 -qO- http://backend-service:8080/health
+     # Expected Error: wget: download timed out
+     ```
+  3. **Inspect Active NetworkPolicies:**
+     ```bash
+     kubectl describe netpol allow-tier1-frontend
+     # Look at Egress rules: notice allowed port is 9090 while backend-service listens on 8080!
+     ```
+
+* **The Learn (Root Cause Analysis):**
+  GKE Dataplane V2 (Cilium eBPF) compiles NetworkPolicies directly into Linux kernel socket filters. If an egress packet's destination port (`8080`) does not match the active whitelist, the kernel silently drops the packet. The frontend TCP socket hangs until client-side timeout occurs.
+
 * **How to Fix:**
-  Align the NetworkPolicy egress port with the backend target port `8080` and re-apply:
+  Restore port `8080` in `phase2/k8s/01-network-policies.yaml`:
   ```yaml
-  ports:
-    - protocol: TCP
-      port: 8080
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: backend
+              tier: tier2
+      ports:
+        - protocol: TCP
+          port: 8080
+  ```
+  ```bash
+  kubectl apply -f phase2/k8s/01-network-policies.yaml
+  ```
+
+* **Verification (How to Confirm Success):**
+  ```bash
+  kubectl exec -it $FRONTEND_POD -- wget -qO- http://backend-service:8080/health
+  # Expected Response: {"status":"UP","tier":"Tier 2"}
   ```
 
 ---
@@ -1157,7 +1239,7 @@ Use these 11 interactive debugging scenarios to simulate real-world GKE producti
 > **Interview Context:** "When running `terraform apply` to provision a new Cloud SQL instance in an existing VPC, Terraform fails with `IP_SPACE_EXHAUSTED` or `Failed to allocate IP range`."
 
 * **How to Break:**
-  Define the Private Service Access global address prefix length as `/29` (providing only 8 IP addresses) instead of `/20`:
+  In `phase2/terraform/vpc.tf`, define the PSA global IP prefix length as `/29` (only 8 IP addresses) instead of `/20`:
   ```hcl
   resource "google_compute_global_address" "private_ip_alloc" {
     name          = "psa-cloudsql-ip-range"
@@ -1167,70 +1249,141 @@ Use these 11 interactive debugging scenarios to simulate real-world GKE producti
     network       = google_compute_network.vpc.id
   }
   ```
-* **The Symptoms:**
-  Terraform outputs:
-  ```text
-  Error: Error creating DatabaseInstance: googleapi: Error 400: The network has no available IP space for Private Service Access allocation. IP_SPACE_EXHAUSTED.
-  ```
-* **The Learn:**
-  Google Cloud Service Networking requires a minimum block size (typically `/24` or `/20` e.g. `10.230.160.0/20`) to allocate internal IPs, underlying routing tables, and tenant project infrastructure for managed services like Cloud SQL, Redis (MemoryStore), and AlloyDB.
+
+* **What to Check & Diagnostic Commands:**
+  1. **Run Terraform Apply & Observe Output:**
+     ```bash
+     cd phase2/terraform && terraform apply -auto-approve
+     ```
+     *Expected Error:*
+     ```text
+     Error: Error creating DatabaseInstance: googleapi: Error 400: The network has no available IP space for Private Service Access allocation. IP_SPACE_EXHAUSTED.
+     ```
+  2. **Inspect Reserved Peering Ranges via gcloud:**
+     ```bash
+     gcloud compute addresses list --global --filter="purpose=VPC_PEERING"
+     # Notice address prefix length is /29 (insufficient for tenant VPC subnets)
+     ```
+
+* **The Learn (Root Cause Analysis):**
+  Google Cloud Service Networking allocates internal subnets, routing tables, and HA standby nodes inside Google's managed Tenant project. A minimum prefix of `/24` (256 IPs) or `/20` (4,096 IPs) is required for Cloud SQL, Redis, and future expansion.
+
 * **How to Fix:**
-  Allocate a prefix length of `/20` (4096 addresses) or `/24` (256 addresses) for the `VPC_PEERING` range.
+  Update `phase2/terraform/vpc.tf` with `prefix_length = 20`:
+  ```hcl
+  resource "google_compute_global_address" "private_ip_alloc" {
+    name          = "psa-cloudsql-ip-range"
+    purpose       = "VPC_PEERING"
+    address_type  = "INTERNAL"
+    prefix_length = 20
+    network       = google_compute_network.vpc.id
+  }
+  ```
+  ```bash
+  terraform apply -auto-approve
+  ```
+
+* **Verification (How to Confirm Success):**
+  ```bash
+  gcloud compute addresses describe psa-cloudsql-ip-range --global --format="value(address,prefixLength)"
+  # Expected: 10.230.160.0, 20
+  ```
 
 ---
 
 ### Case 4: GKE Master Authorized Networks Blocking `kubectl`
 > [!WARNING]
-> **Interview Context:** "A developer on your team attempts to run `kubectl get pods` from their home machine and receives `Unable to connect to the server: dial tcp [IP]:443: i/o timeout`."
+> **Interview Context:** "A developer on your team attempts to run `kubectl get pods` from their machine and receives `Unable to connect to the server: dial tcp [IP]:443: i/o timeout`."
 
 * **How to Break:**
-  Set `master_authorized_networks_config` in `gke.tf` to a dummy CIDR like `192.0.2.1/32` (TEST-NET-1) and run `terraform apply`.
-* **The Symptoms:**
-  Running any `kubectl` command hangs and exits with:
-  ```text
-  Unable to connect to the server: dial tcp 172.16.0.2:443: i/o timeout
-  # or
-  Error: Error from server (Forbidden): client IP "X.X.X.X" is not authorized to access master
+  Lock the master authorized network to a non-routable dummy IP (`192.0.2.1/32`):
+  ```bash
+  gcloud container clusters update gke-3tier-prod \
+    --zone us-east4-a \
+    --enable-master-authorized-networks \
+    --master-authorized-networks 192.0.2.1/32
   ```
-* **The Learn:**
-  GKE Master Authorized Networks injects Google Cloud Firewall rules in front of the Kubernetes API control plane. Any source IP outside the specified CIDR ranges is denied access at the network edge.
+
+* **What to Check & Diagnostic Commands:**
+  1. **Execute Any kubectl Command:**
+     ```bash
+     kubectl get pods
+     ```
+     *Expected Error:*
+     ```text
+     Unable to connect to the server: dial tcp 10.0.2.x:443: i/o timeout
+     # or
+     Error from server (Forbidden): client IP "X.X.X.X" is not authorized to access master
+     ```
+  2. **Inspect Authorized Network Configuration:**
+     ```bash
+     gcloud container clusters describe gke-3tier-prod --zone us-east4-a \
+       --format="yaml(masterAuthorizedNetworksConfig)"
+     ```
+
+* **The Learn (Root Cause Analysis):**
+  GKE Master Authorized Networks injects Google Cloud perimeter firewall rules directly in front of the managed `kube-apiserver` endpoint. Any client IP address outside the authorized list is dropped at the GCP edge before reaching TLS handshake.
+
 * **How to Fix:**
-  Add your current public IP address (found via `curl ifconfig.me`) to the authorized CIDR blocks:
+  Detect your current public IP address and whitelist it:
   ```bash
   MY_IP="$(curl -s ifconfig.me)/32"
   gcloud container clusters update gke-3tier-prod \
-    --region us-east4-a \
+    --zone us-east4-a \
     --enable-master-authorized-networks \
     --master-authorized-networks ${MY_IP}
   ```
 
+* **Verification (How to Confirm Success):**
+  ```bash
+  kubectl get nodes
+  # Expected: All worker nodes return status Ready
+  ```
+
 ---
 
-### Case 5: Container Cold-Start & Unset CPU Requests Leading to OOMKills
+### Case 5: Container Cold-Start & Memory Limits / OOMKills (Exit Code 137)
 > [!WARNING]
 > **Interview Context:** "Under heavy traffic, GKE pods randomly disappear and restart with status `OOMKilled`, while cluster nodes show low total memory utilization."
 
 * **How to Break:**
-  Omit memory limits or set an unrealistically low memory limit (e.g. `memory: 32Mi`) in `03-tier2-backend.yaml`:
+  Set an unrealistically low memory limit (`32Mi`) in `phase2/k8s/03-tier2-backend.yaml`:
   ```yaml
   resources:
+    requests:
+      cpu: 100m
+      memory: 16Mi
     limits:
-      memory: 32Mi # Node.js runtime requires ~60-100Mi minimum
+      cpu: 200m
+      memory: 32Mi # Node.js V8 runtime baseline memory is ~60-100Mi
   ```
-* **The Symptoms:**
-  `kubectl get pods` shows pod restarts increasing:
-  ```text
-  NAME                                 READY   STATUS      RESTARTS   AGE
-  backend-deployment-6d4b9777-x89qp    1/2     OOMKilled   5          4m
+  ```bash
+  kubectl apply -f phase2/k8s/03-tier2-backend.yaml
   ```
-  `kubectl describe pod` displays:
-  ```text
-  Last State: Terminated, Reason: OOMKilled, Exit Code: 137
-  ```
-* **The Learn:**
-  When a container exceeds its declared Cgroup memory limit, the Linux Kernel OOM killer terminates the process immediately (Exit Code 137). Setting explicit `requests` and `limits` allows the Kubernetes Scheduler to place pods on nodes with guaranteed capacity.
+
+* **What to Check & Diagnostic Commands:**
+  1. **Check Pod Restarts & Status:**
+     ```bash
+     kubectl get pods -l app=backend
+     # Expected: STATUS: OOMKilled or CrashLoopBackOff | RESTARTS increasing
+     ```
+  2. **Inspect Pod Termination Reason:**
+     ```bash
+     BACKEND_POD=$(kubectl get pods -l app=backend -o jsonpath='{.items[0].metadata.name}')
+     kubectl describe pod $BACKEND_POD | grep -A 5 "Last State"
+     ```
+     *Expected Output:*
+     ```text
+     Last State:     Terminated
+       Reason:       OOMKilled
+       Exit Code:    137
+     ```
+
+* **The Learn (Root Cause Analysis):**
+  When a container process allocates more physical memory than its Cgroup `limits.memory` threshold, the Linux kernel Out-Of-Memory (OOM) killer sends `SIGKILL` (`kill -9`, Exit Code $128 + 9 = 137$). The node may have 80% free memory, but the container Cgroup boundary is strictly enforced.
+
 * **How to Fix:**
-  Right-size memory requests and limits based on profiling:
+  Right-size memory requests and limits in `phase2/k8s/03-tier2-backend.yaml`:
   ```yaml
   resources:
     requests:
@@ -1240,6 +1393,15 @@ Use these 11 interactive debugging scenarios to simulate real-world GKE producti
       cpu: 500m
       memory: 512Mi
   ```
+  ```bash
+  kubectl apply -f phase2/k8s/03-tier2-backend.yaml
+  ```
+
+* **Verification (How to Confirm Success):**
+  ```bash
+  kubectl top pod -l app=backend
+  # Expected: Active memory utilization displayed well below 512Mi limit
+  ```
 
 ---
 
@@ -1248,17 +1410,51 @@ Use these 11 interactive debugging scenarios to simulate real-world GKE producti
 > **Interview Context:** "You deployed a GKE Ingress object backed by a ClusterIP service, but the Google Cloud HTTP(S) Load Balancer health checks fail consistently, returning `502 Server Error`."
 
 * **How to Break:**
-  Remove the `cloud.google.com/neg: '{"ingress": true}'` annotation from `02-tier1-frontend.yaml`.
-* **The Symptoms:**
-  `gcloud compute backend-services list` shows the backend service health status as `UNHEALTHY`. Navigating to the Ingress IP returns HTTP `502 Bad Gateway`.
-* **The Learn:**
-  GKE Ingress defaults to node-level routing (`NodePort`) unless Network Endpoint Groups (NEGs) are enabled. With NEGs enabled via container-native load balancing, the GCP ALB routes traffic directly to Pod IPs, decreasing latency and bypassing `kube-proxy`.
+  Remove the NEG annotation from `phase2/k8s/02-tier1-frontend.yaml`:
+  ```yaml
+  # Comment out or delete this annotation:
+  # cloud.google.com/neg: '{"ingress": true}'
+  ```
+  ```bash
+  kubectl apply -f phase2/k8s/02-tier1-frontend.yaml
+  ```
+
+* **What to Check & Diagnostic Commands:**
+  1. **Test Ingress IP Endpoint:**
+     ```bash
+     INGRESS_IP=$(kubectl get ingress gke-prod-ingress -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+     curl -s -I http://${INGRESS_IP}/
+     # Expected Output: HTTP/1.1 502 Bad Gateway
+     ```
+  2. **Inspect GCP Backend Service Health:**
+     ```bash
+     gcloud compute backend-services list --format="table(name,healthChecks,backends[].group)"
+     # Backend health shows UNHEALTHY or empty NEG targets
+     ```
+  3. **Check Service Annotations:**
+     ```bash
+     kubectl get svc frontend-service -o yaml | grep neg
+     # Notice annotation is missing!
+     ```
+
+* **The Learn (Root Cause Analysis):**
+  In GKE Dataplane V2, GCE Ingress defaults to Standalone Network Endpoint Groups (NEGs). Without `cloud.google.com/neg: '{"ingress": true}'`, the GCP Application Load Balancer cannot register Pod private IPs directly into its Anycast routing mesh.
+
 * **How to Fix:**
-  Add the NEG annotation to your Kubernetes Service manifest:
+  Restore the NEG annotation in `phase2/k8s/02-tier1-frontend.yaml`:
   ```yaml
   metadata:
     annotations:
       cloud.google.com/neg: '{"ingress": true}'
+  ```
+  ```bash
+  kubectl apply -f phase2/k8s/02-tier1-frontend.yaml
+  ```
+
+* **Verification (How to Confirm Success):**
+  ```bash
+  curl -s -I http://${INGRESS_IP}/
+  # Expected: HTTP/1.1 200 OK
   ```
 
 ---
@@ -1268,27 +1464,53 @@ Use these 11 interactive debugging scenarios to simulate real-world GKE producti
 > **Interview Context:** "Workload Identity is configured, but the Cloud SQL Auth Proxy sidecar logs `accessNotConfigured` or `Client does not have permission` when attempting to connect to PostgreSQL."
 
 * **How to Break:**
-  Revoke the `roles/cloudsql.client` IAM role from the GCP Service Account:
+  Revoke the `roles/cloudsql.client` role from the backend Service Account:
   ```bash
-  gcloud projects remove-iam-policy-binding $PROJECT_ID \
-    --member="serviceAccount:sa-app-backend@$PROJECT_ID.iam.gserviceaccount.com" \
+  gcloud projects remove-iam-policy-binding ${PROJECT_ID} \
+    --member="serviceAccount:sa-app-backend@${PROJECT_ID}.iam.gserviceaccount.com" \
     --role="roles/cloudsql.client"
+
+  kubectl rollout restart deployment backend-deployment
   ```
-* **The Symptoms:**
-  The `cloud-sql-proxy` sidecar container logs:
-  ```text
-  errors: googleapi: Error 403: The client is not authorized to make this request., accessNotConfigured
-  ```
-* **The Learn:**
-  Connecting via Cloud SQL Auth Proxy requires two authentication layers:
-  1. Workload Identity (authenticates *who* the pod is).
-  2. GCP IAM Role `roles/cloudsql.client` (authorizes *what* the service account can do).
+
+* **What to Check & Diagnostic Commands:**
+  1. **Check Cloud SQL Proxy Sidecar Logs:**
+     ```bash
+     BACKEND_POD=$(kubectl get pods -l app=backend -o jsonpath='{.items[0].metadata.name}')
+     kubectl logs $BACKEND_POD -c cloud-sql-proxy --tail=50
+     ```
+     *Expected Error Signature:*
+     ```text
+     errors: googleapi: Error 403: The client is not authorized to make this request., accessNotConfigured
+     failed to get instance: Refresh error: failed to get instance metadata: 403 Forbidden
+     ```
+  2. **Verify Project-Level IAM Roles for the GSA:**
+     ```bash
+     gcloud projects get-iam-policy ${PROJECT_ID} \
+       --flatten="bindings[].members" \
+       --filter="bindings.members:sa-app-backend@${PROJECT_ID}.iam.gserviceaccount.com" \
+       --format="table(bindings.role)"
+     # Notice roles/cloudsql.client is absent!
+     ```
+
+* **The Learn (Root Cause Analysis):**
+  Workload Identity validates identity (authenticating *who* the pod is), but GCP Cloud IAM controls authorization (*what* the identity can do). Without `roles/cloudsql.client`, Cloud SQL Admin API rejects the proxy's ephemeral certificate signing requests.
+
 * **How to Fix:**
-  Re-grant the Cloud SQL Client role to the service account:
+  Re-grant `roles/cloudsql.client` to the service account:
   ```bash
-  gcloud projects add-iam-policy-binding $PROJECT_ID \
-    --member="serviceAccount:sa-app-backend@$PROJECT_ID.iam.gserviceaccount.com" \
+  gcloud projects add-iam-policy-binding ${PROJECT_ID} \
+    --member="serviceAccount:sa-app-backend@${PROJECT_ID}.iam.gserviceaccount.com" \
     --role="roles/cloudsql.client"
+
+  kubectl rollout restart deployment backend-deployment
+  ```
+
+* **Verification (How to Confirm Success):**
+  ```bash
+  BACKEND_POD=$(kubectl get pods -l app=backend -o jsonpath='{.items[0].metadata.name}')
+  kubectl logs $BACKEND_POD -c cloud-sql-proxy --tail=20
+  # Expected: "The proxy has started successfully and is ready for new connections!"
   ```
 
 ---
@@ -1298,20 +1520,45 @@ Use these 11 interactive debugging scenarios to simulate real-world GKE producti
 > **Interview Context:** "During a node upgrade, a pod bound to a PersistentVolume gets stuck in state `Pending` with warning `VolumeZoneConflict`."
 
 * **How to Break:**
-  Provision a standard Compute Engine persistent disk (`pd-standard`) in zone `us-east4-a` and attempt to schedule the consuming pod onto a GKE node in zone `us-east4-b`.
-* **The Symptoms:**
-  `kubectl get pods` shows status `Pending`. `kubectl describe pod` outputs:
-  ```text
-  Events:
-    Type     Reason            Age   From               Message
-    ----     ------            ----  ----               -------
-    Warning  FailedScheduling  30s   default-scheduler  0/3 nodes are available: 3 node(s) had volume node affinity conflict. node(s) didn't match pod affinity/anti-affinity.
-  ```
-* **The Learn:**
-  Standard GCP Compute Engine zonal Persistent Disks (`pd-standard` / `pd-ssd`) cannot cross availability zone boundaries. If GKE reschedules a pod to a node in a different AZ, the disk attachment fails.
+  Provision a zonal Persistent Disk in zone `us-east4-a` and attempt to force-schedule the consuming pod onto a node in zone `us-east4-b` via `nodeSelector`.
+
+* **What to Check & Diagnostic Commands:**
+  1. **Check Pod Status:**
+     ```bash
+     kubectl get pods -l tier=stateful
+     # Expected: STATUS: Pending
+     ```
+  2. **Inspect Scheduling Failure Events:**
+     ```bash
+     kubectl describe pod <pending-pod>
+     ```
+     *Expected Error:*
+     ```text
+     Warning  FailedScheduling  30s  default-scheduler  0/4 nodes are available: 4 node(s) had volume node affinity conflict.
+     ```
+
+* **The Learn (Root Cause Analysis):**
+  Standard GCP Compute Engine zonal Persistent Disks (`pd-standard` / `pd-balanced`) are physically bound to hypervisors in a single Availability Zone. A pod scheduled in zone `us-east4-b` cannot attach a block disk located in `us-east4-a`.
+
 * **How to Fix:**
-  1. Use Regional Persistent Disks (`pd-regional-gcp`) that asynchronously replicate across two zones.
-  2. Or define topology-aware volume binding by setting `volumeBindingMode: WaitForFirstConsumer` in your `StorageClass`.
+  Use topology-aware dynamic volume binding (`volumeBindingMode: WaitForFirstConsumer`) in the `StorageClass`:
+  ```yaml
+  apiVersion: storage.k8s.io/v1
+  kind: StorageClass
+  metadata:
+    name: topology-aware-sc
+  provisioner: pd.csi.storage.gke.io
+  volumeBindingMode: WaitForFirstConsumer
+  allowVolumeExpansion: true
+  parameters:
+    type: pd-balanced
+  ```
+
+* **Verification (How to Confirm Success):**
+  ```bash
+  kubectl get pvc,pv
+  # Expected: STATUS: Bound, and Pod transitions to Running in the exact AZ where the PV was provisioned
+  ```
 
 ---
 
@@ -1319,22 +1566,29 @@ Use these 11 interactive debugging scenarios to simulate real-world GKE producti
 > [!WARNING]
 > **Interview Context:** "An attacker compromises a Tier 1 frontend pod and attempts to directly scan or connect to the Cloud SQL database IP (`10.230.160.x:5432`) to bypass the API layer."
 
-* **How to Break:**
-  From inside the Tier 1 frontend container, execute a raw TCP connection attempt directly against the Cloud SQL Private IP:
+* **How to Break (Execute Attack Simulation):**
   ```bash
   CLOUDSQL_IP=$(cd phase2/terraform && terraform output -raw cloudsql_private_ip)
   FRONTEND_POD=$(kubectl get pods -l app=frontend -o jsonpath='{.items[0].metadata.name}')
   kubectl exec -it $FRONTEND_POD -- nc -zv -w 3 $CLOUDSQL_IP 5432
   ```
-* **The Symptoms:**
-  The command hangs for 3 seconds and fails:
+
+* **What to Check & Diagnostic Commands:**
+  *Observed Attack Simulation Output:*
   ```text
   nc: connect to 10.230.160.3 port 5432 (tcp) timed out: Operation now in progress
   ```
-* **The Learn:**
-  Because the Tier 1 NetworkPolicy (`allow-tier1-frontend`) only grants egress access to pods with label `tier: tier2` on port `8080`, Dataplane V2 (eBPF) drops packets destined for `10.230.160.x:5432` at the socket level. The 3-Tier security boundary remains completely intact!
+  *Verify Active Defense Rules:*
+  ```bash
+  kubectl get netpol allow-tier1-frontend -o yaml
+  # Confirm egress ONLY permits destination app: backend on port 8080
+  ```
+
+* **The Learn (Root Cause Analysis):**
+  Under GKE Dataplane V2 (Cilium eBPF), packets originating from frontend pods destined for `10.230.160.3:5432` are dropped immediately at the Linux kernel socket level before traversing the node's physical NIC. The database layer remains completely immune to frontend compromise.
+
 * **How to Fix:**
-  No fix required — this confirms that **Defense-in-Depth** and **Zero-Trust Network Segmentation** are working as designed!
+  No fix needed — this demonstrates verified **Zero-Trust Network Segmentation** in action!
 
 ---
 
@@ -1343,34 +1597,62 @@ Use these 11 interactive debugging scenarios to simulate real-world GKE producti
 > **Interview Context:** "Your backend pod is `2/2 Running`, but executing database queries returns `Connection terminated unexpectedly` or hangs for 5 seconds."
 
 * **How to Break:**
-  Remove the `--private-ip` argument from the `cloud-sql-proxy` container args in `03-tier2-backend.yaml`:
+  Remove `--private-ip` from `cloud-sql-proxy` args in `phase2/k8s/03-tier2-backend.yaml`:
   ```yaml
-  args:
-    - "--structured-logs"
-    - "--port=5432"
-    # Omitted: - "--private-ip"
-    - "practice-502506:us-east4:cloudsql-3tier-db"
+  # In 03-tier2-backend.yaml
+  containers:
+    - name: cloud-sql-proxy
+      args:
+        - "--structured-logs"
+        - "--port=5432"
+        # Omitted: - "--private-ip"
+        - "practice-502506:us-east4:cloudsql-3tier-db"
   ```
-* **The Symptoms:**
-  Querying the backend API database health check endpoint fails:
   ```bash
-  kubectl exec -it $BACKEND_POD -c api-app -- node -e 'http = require("http"); http.get("http://127.0.0.1:8080/db-health", res => res.on("data", d => console.log(d.toString())))'
-  # Output: {"status":"DISCONNECTED","error":"Connection terminated unexpectedly"}
+  kubectl apply -f phase2/k8s/03-tier2-backend.yaml
   ```
-  `cloud-sql-proxy` logs show:
-  ```text
-  [practice-502506:us-east4:cloudsql-3tier-db] failed to connect to instance: failed to get instance: instance does not have a public IP address
-  ```
-* **The Learn:**
-  Cloud SQL Auth Proxy v2 defaults to looking up the target instance's Public IPv4 address. When Cloud SQL is provisioned with `ipv4_enabled = false` and attached to Private Service Access (`psa-cloudsql-ip-range`), the proxy must be explicitly instructed to route over the private network via `--private-ip`.
+
+* **What to Check & Diagnostic Commands:**
+  1. **Check Pod Status (Pod appears Running!):**
+     ```bash
+     kubectl get pods -l app=backend
+     # STATUS: Running | READY: 2/2
+     ```
+  2. **Execute Database Health Query from API Container:**
+     ```bash
+     BACKEND_POD=$(kubectl get pods -l app=backend -o jsonpath='{.items[0].metadata.name}')
+     kubectl exec -it $BACKEND_POD -c api-app -- node -e 'http = require("http"); http.get("http://127.0.0.1:8080/db-health", res => res.on("data", d => console.log(d.toString())))'
+     # Expected Error: {"status":"DISCONNECTED","error":"Connection terminated unexpectedly"}
+     ```
+  3. **Inspect Cloud SQL Proxy Logs:**
+     ```bash
+     kubectl logs $BACKEND_POD -c cloud-sql-proxy --tail=50
+     ```
+     *Expected Error Signature:*
+     ```text
+     [practice-502506:us-east4:cloudsql-3tier-db] failed to connect to instance: failed to get instance: instance does not have a public IP address
+     ```
+
+* **The Learn (Root Cause Analysis):**
+  Cloud SQL Auth Proxy v2 defaults to looking up the target instance's Public IPv4 address. When Cloud SQL is provisioned with `ipv4_enabled = false` and connected via Private Service Access (`psa-cloudsql-ip-range`), the proxy must be explicitly instructed to route over the private network via `--private-ip`.
+
 * **How to Fix:**
-  Add `--private-ip` to the container arguments in `03-tier2-backend.yaml` and re-apply:
+  Add `--private-ip` to the container arguments in `phase2/k8s/03-tier2-backend.yaml`:
   ```yaml
   args:
     - "--structured-logs"
     - "--port=5432"
     - "--private-ip"
     - "practice-502506:us-east4:cloudsql-3tier-db"
+  ```
+  ```bash
+  kubectl apply -f phase2/k8s/03-tier2-backend.yaml
+  ```
+
+* **Verification (How to Confirm Success):**
+  ```bash
+  kubectl exec -it $BACKEND_POD -c api-app -- node -e 'http = require("http"); http.get("http://127.0.0.1:8080/db-health", res => res.on("data", d => console.log(d.toString())))'
+  # Expected Response: {"status":"CONNECTED","database":"appdb","timestamp":"2026-08-20T..."}
   ```
 
 ---
@@ -1392,15 +1674,31 @@ Use these 11 interactive debugging scenarios to simulate real-world GKE producti
         - protocol: UDP
           port: 53
   ```
-* **The Symptoms:**
-  Outbound DNS resolution hangs and fails:
-  ```text
-  dial tcp: lookup sqladmin.googleapis.com on 10.101.0.10:53: read udp 10.100.1.12:52432->10.101.0.10:53: i/o timeout
+  ```bash
+  kubectl apply -f phase2/k8s/01-network-policies.yaml
   ```
-* **The Learn:**
-  In GKE Dataplane V2 clusters, DNS traffic is intercepted by the host DaemonSet `node-local-dns` (`k8s-app: node-local-dns`) running on `10.101.0.10`. Because `node-local-dns` pods do not carry the `k8s-app: kube-dns` label, Dataplane V2 eBPF drops all outbound UDP port 53 packets.
+
+* **What to Check & Diagnostic Commands:**
+  1. **Check Backend API or Cloud SQL Proxy Logs:**
+     ```bash
+     BACKEND_POD=$(kubectl get pods -l app=backend -o jsonpath='{.items[0].metadata.name}')
+     kubectl logs $BACKEND_POD -c cloud-sql-proxy --tail=50
+     ```
+     *Expected Error Signature:*
+     ```text
+     dial tcp: lookup sqladmin.googleapis.com on 10.101.0.10:53: read udp 10.100.1.12:52432->10.101.0.10:53: i/o timeout
+     ```
+  2. **Inspect Cluster DNS DaemonSets:**
+     ```bash
+     kubectl get pods -n kube-system -o wide --show-labels | grep dns
+     # Notice GKE runs node-local-dns (label: k8s-app=node-local-dns), NOT kube-dns on node 10.101.0.10!
+     ```
+
+* **The Learn (Root Cause Analysis):**
+  In GKE Dataplane V2 clusters, local DNS resolution runs as a host DaemonSet (`node-local-dns`) listening on `10.101.0.10`. Because `node-local-dns` pods carry the label `k8s-app: node-local-dns`, restricting the NetworkPolicy egress to `k8s-app: kube-dns` causes the Linux kernel eBPF filter to drop all UDP port 53 packets.
+
 * **How to Fix:**
-  In Kubernetes NetworkPolicies, always permit port 53 (UDP and TCP) without label constraints:
+  In `phase2/k8s/01-network-policies.yaml`, permit UDP & TCP port 53 to all destinations:
   ```yaml
   egress:
     - ports:
@@ -1409,4 +1707,14 @@ Use these 11 interactive debugging scenarios to simulate real-world GKE producti
         - protocol: TCP
           port: 53
   ```
+  ```bash
+  kubectl apply -f phase2/k8s/01-network-policies.yaml
+  ```
+
+* **Verification (How to Confirm Success):**
+  ```bash
+  kubectl exec -it $BACKEND_POD -c api-app -- node -e 'http = require("http"); http.get("http://127.0.0.1:8080/db-health", res => res.on("data", d => console.log(d.toString())))'
+  # Expected Response: {"status":"CONNECTED","database":"appdb"}
+  ```
+
 
