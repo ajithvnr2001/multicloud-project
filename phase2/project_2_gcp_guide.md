@@ -1075,33 +1075,42 @@ kubectl exec -it $FRONTEND_POD -- nc -zv -w 3 $CLOUDSQL_IP 5432 || echo "Tier 1 
 
 ## 6. "Break & Learn" Test Cases (Interactive Interview Debugging Lab)
 
-Use these 9 interactive debugging scenarios to simulate real-world GKE production incidents, observe failure symptoms, and master root-cause resolution.
+Use these 11 interactive debugging scenarios to simulate real-world GKE production incidents, observe failure symptoms, and master root-cause resolution.
 
 ---
 
-### Case 1: Workload Identity IAM Binding Mismatch
+### Case 1: Workload Identity IAM Binding & Placeholder Mismatch
 > [!WARNING]
 > **Interview Context:** "Your application pod deploys and runs, but the Cloud SQL Auth Proxy sidecar crashes continuously with `google: could not find default credentials` or `403 Forbidden` on the Cloud SQL API."
 
 * **How to Break:**
-  Delete the Workload Identity IAM binding between the GCP Service Account and the Kubernetes Service Account:
-  ```bash
-  gcloud iam service-accounts remove-iam-policy-binding \
-    sa-app-backend@$PROJECT_ID.iam.gserviceaccount.com \
-    --role="roles/iam.workloadIdentityUser" \
-    --member="serviceAccount:$PROJECT_ID.svc.id.goog[default/ksa-app-backend]"
-  ```
+  1. Overwrite the ServiceAccount annotation with an un-substituted placeholder string:
+     ```bash
+     kubectl annotate serviceaccount ksa-app-backend --overwrite \
+       iam.gke.io/gcp-service-account="sa-app-backend@PROJECT_ID.iam.gserviceaccount.com"
+     ```
+  2. Or delete the Workload Identity IAM policy binding on GCP IAM:
+     ```bash
+     gcloud iam service-accounts remove-iam-policy-binding \
+       sa-app-backend@$PROJECT_ID.iam.gserviceaccount.com \
+       --role="roles/iam.workloadIdentityUser" \
+       --member="serviceAccount:$PROJECT_ID.svc.id.goog[default/ksa-app-backend]"
+     ```
 * **The Symptoms:**
   `kubectl logs` on the `cloud-sql-proxy` container shows:
   ```text
   critical: option error: failed to authorize: google: could not find default credentials. 
-  See https://developers.google.com/accounts/docs/application-default-credentials for more information.
+  The proxy has encountered a terminal error: unable to start: error initializing dialer: failed to create token source
   ```
+  The pod enters `CrashLoopBackOff` with `1/2 READY`.
 * **The Learn:**
-  Without the `roles/iam.workloadIdentityUser` IAM binding on the GSA, the GKE Metadata server rejects token exchange attempts from the KSA. The pod fails to receive Google Application Default Credentials (ADC).
+  Without the `roles/iam.workloadIdentityUser` IAM binding and a matching `iam.gke.io/gcp-service-account` annotation with the real project ID, the GKE Metadata Server rejects token exchange attempts from the KSA. The pod fails to receive Google Application Default Credentials (ADC).
 * **How to Fix:**
-  Re-add the IAM policy binding and ensure the KSA annotation `iam.gke.io/gcp-service-account` matches the GSA email exactly:
+  Set the real project ID in the KSA annotation and re-grant the IAM binding:
   ```bash
+  kubectl annotate serviceaccount ksa-app-backend --overwrite \
+    iam.gke.io/gcp-service-account="sa-app-backend@$PROJECT_ID.iam.gserviceaccount.com"
+  
   gcloud iam service-accounts add-iam-policy-binding \
     sa-app-backend@$PROJECT_ID.iam.gserviceaccount.com \
     --role="roles/iam.workloadIdentityUser" \
@@ -1127,6 +1136,7 @@ Use these 9 interactive debugging scenarios to simulate real-world GKE productio
 * **The Symptoms:**
   Executing an HTTP request from inside the frontend pod times out:
   ```bash
+  FRONTEND_POD=$(kubectl get pods -l app=frontend -o jsonpath='{.items[0].metadata.name}')
   kubectl exec -it $FRONTEND_POD -- wget -T 5 -qO- http://backend-service:8080/health
   # Result: wget: download timed out
   ```
@@ -1163,7 +1173,7 @@ Use these 9 interactive debugging scenarios to simulate real-world GKE productio
   Error: Error creating DatabaseInstance: googleapi: Error 400: The network has no available IP space for Private Service Access allocation. IP_SPACE_EXHAUSTED.
   ```
 * **The Learn:**
-  Google Cloud Service Networking requires a minimum block size (typically `/24` or `/20`) to allocate internal IPs, underlying routing tables, and tenant project infrastructure for managed services like Cloud SQL, Redis (MemoryStore), and AlloyDB.
+  Google Cloud Service Networking requires a minimum block size (typically `/24` or `/20` e.g. `10.230.160.0/20`) to allocate internal IPs, underlying routing tables, and tenant project infrastructure for managed services like Cloud SQL, Redis (MemoryStore), and AlloyDB.
 * **How to Fix:**
   Allocate a prefix length of `/20` (4096 addresses) or `/24` (256 addresses) for the `VPC_PEERING` range.
 
@@ -1189,7 +1199,7 @@ Use these 9 interactive debugging scenarios to simulate real-world GKE productio
   ```bash
   MY_IP="$(curl -s ifconfig.me)/32"
   gcloud container clusters update gke-3tier-prod \
-    --region us-central1 \
+    --region us-east4-a \
     --enable-master-authorized-networks \
     --master-authorized-networks ${MY_IP}
   ```
@@ -1288,7 +1298,7 @@ Use these 9 interactive debugging scenarios to simulate real-world GKE productio
 > **Interview Context:** "During a node upgrade, a pod bound to a PersistentVolume gets stuck in state `Pending` with warning `VolumeZoneConflict`."
 
 * **How to Break:**
-  Provision a standard Compute Engine persistent disk (`pd-standard`) in zone `us-central1-a` and attempt to schedule the consuming pod onto a GKE node in zone `us-central1-b`.
+  Provision a standard Compute Engine persistent disk (`pd-standard`) in zone `us-east4-a` and attempt to schedule the consuming pod onto a GKE node in zone `us-east4-b`.
 * **The Symptoms:**
   `kubectl get pods` shows status `Pending`. `kubectl describe pod` outputs:
   ```text
@@ -1307,20 +1317,96 @@ Use these 9 interactive debugging scenarios to simulate real-world GKE productio
 
 ### Case 9: Direct Tier 1 -> Tier 3 Network Policy Violation Attempt
 > [!WARNING]
-> **Interview Context:** "An attacker compromises a Tier 1 frontend pod and attempts to directly scan or connect to the Cloud SQL database IP (`10.0.3.x:5432`) to bypass the API layer."
+> **Interview Context:** "An attacker compromises a Tier 1 frontend pod and attempts to directly scan or connect to the Cloud SQL database IP (`10.230.160.x:5432`) to bypass the API layer."
 
 * **How to Break:**
   From inside the Tier 1 frontend container, execute a raw TCP connection attempt directly against the Cloud SQL Private IP:
   ```bash
-  CLOUDSQL_IP=$(cd project-2/terraform && terraform output -raw cloudsql_private_ip)
+  CLOUDSQL_IP=$(cd phase2/terraform && terraform output -raw cloudsql_private_ip)
+  FRONTEND_POD=$(kubectl get pods -l app=frontend -o jsonpath='{.items[0].metadata.name}')
   kubectl exec -it $FRONTEND_POD -- nc -zv -w 3 $CLOUDSQL_IP 5432
   ```
 * **The Symptoms:**
   The command hangs for 3 seconds and fails:
   ```text
-  nc: connect to 10.0.3.2 port 5432 (tcp) timed out: Operation now in progress
+  nc: connect to 10.230.160.3 port 5432 (tcp) timed out: Operation now in progress
   ```
 * **The Learn:**
-  Because the Tier 1 NetworkPolicy (`allow-tier1-frontend`) only grants egress access to pods with label `tier: tier2` on port `8080`, Dataplane V2 (eBPF) drops packets destined for `10.0.3.x:5432` at the socket level. The 3-Tier security boundary remains completely intact!
+  Because the Tier 1 NetworkPolicy (`allow-tier1-frontend`) only grants egress access to pods with label `tier: tier2` on port `8080`, Dataplane V2 (eBPF) drops packets destined for `10.230.160.x:5432` at the socket level. The 3-Tier security boundary remains completely intact!
 * **How to Fix:**
   No fix required — this confirms that **Defense-in-Depth** and **Zero-Trust Network Segmentation** are working as designed!
+
+---
+
+### Case 10: Cloud SQL Proxy Missing `--private-ip` Flag on Private-Only Instances
+> [!WARNING]
+> **Interview Context:** "Your backend pod is `2/2 Running`, but executing database queries returns `Connection terminated unexpectedly` or hangs for 5 seconds."
+
+* **How to Break:**
+  Remove the `--private-ip` argument from the `cloud-sql-proxy` container args in `03-tier2-backend.yaml`:
+  ```yaml
+  args:
+    - "--structured-logs"
+    - "--port=5432"
+    # Omitted: - "--private-ip"
+    - "practice-502506:us-east4:cloudsql-3tier-db"
+  ```
+* **The Symptoms:**
+  Querying the backend API database health check endpoint fails:
+  ```bash
+  kubectl exec -it $BACKEND_POD -c api-app -- node -e 'http = require("http"); http.get("http://127.0.0.1:8080/db-health", res => res.on("data", d => console.log(d.toString())))'
+  # Output: {"status":"DISCONNECTED","error":"Connection terminated unexpectedly"}
+  ```
+  `cloud-sql-proxy` logs show:
+  ```text
+  [practice-502506:us-east4:cloudsql-3tier-db] failed to connect to instance: failed to get instance: instance does not have a public IP address
+  ```
+* **The Learn:**
+  Cloud SQL Auth Proxy v2 defaults to looking up the target instance's Public IPv4 address. When Cloud SQL is provisioned with `ipv4_enabled = false` and attached to Private Service Access (`psa-cloudsql-ip-range`), the proxy must be explicitly instructed to route over the private network via `--private-ip`.
+* **How to Fix:**
+  Add `--private-ip` to the container arguments in `03-tier2-backend.yaml` and re-apply:
+  ```yaml
+  args:
+    - "--structured-logs"
+    - "--port=5432"
+    - "--private-ip"
+    - "practice-502506:us-east4:cloudsql-3tier-db"
+  ```
+
+---
+
+### Case 11: Silent Node-Local-DNS Socket Drop via Restrictive NetworkPolicy
+> [!WARNING]
+> **Interview Context:** "After applying `default-deny-all` and an egress rule matching `k8s-app: kube-dns`, pods fail with `lookup sqladmin.googleapis.com on 10.101.0.10:53: read udp ... i/o timeout`."
+
+* **How to Break:**
+  Define the DNS egress rule using a restrictive pod label selector:
+  ```yaml
+  egress:
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+  ```
+* **The Symptoms:**
+  Outbound DNS resolution hangs and fails:
+  ```text
+  dial tcp: lookup sqladmin.googleapis.com on 10.101.0.10:53: read udp 10.100.1.12:52432->10.101.0.10:53: i/o timeout
+  ```
+* **The Learn:**
+  In GKE Dataplane V2 clusters, DNS traffic is intercepted by the host DaemonSet `node-local-dns` (`k8s-app: node-local-dns`) running on `10.101.0.10`. Because `node-local-dns` pods do not carry the `k8s-app: kube-dns` label, Dataplane V2 eBPF drops all outbound UDP port 53 packets.
+* **How to Fix:**
+  In Kubernetes NetworkPolicies, always permit port 53 (UDP and TCP) without label constraints:
+  ```yaml
+  egress:
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+  ```
+
