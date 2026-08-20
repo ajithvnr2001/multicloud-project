@@ -65,6 +65,7 @@ spec:
           args:
             - "--structured-logs"
             - "--port=5432"
+            - "--private-ip"
             - "practice-502506:us-east4:cloudsql-3tier-db"
           securityContext:
             runAsNonRoot: true

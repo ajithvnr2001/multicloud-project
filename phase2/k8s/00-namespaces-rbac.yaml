@@ -4,4 +4,4 @@ metadata:
   name: ksa-app-backend
   namespace: default
   annotations:
-    iam.gke.io/gcp-service-account: "sa-app-backend@PROJECT_ID.iam.gserviceaccount.com"
+    iam.gke.io/gcp-service-account: "sa-app-backend@practice-502506.iam.gserviceaccount.com"
