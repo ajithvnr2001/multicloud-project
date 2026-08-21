@@ -1522,7 +1522,7 @@ export ZONE="us-east4-a"
 
 ---
 
-### Case 8: Multi-AZ PVC Volume Zone Mismatch during Pod Rescheduling
+### Case 8: Multi-AZ PVC Volume Zone Mismatch
 > [!WARNING]
 > **Interview Context:** "During a node upgrade, a pod bound to a PersistentVolume gets stuck in state `Pending` with warning `VolumeZoneConflict`."
 
@@ -1569,38 +1569,80 @@ export ZONE="us-east4-a"
 
 ---
 
-### Case 9: Direct Tier 1 -> Tier 3 Network Policy Violation Attempt
+### Case 9: Direct Tier 1 -> Tier 3 Network Policy Violation Attempt (Security Penetration Test)
 > [!WARNING]
-> **Interview Context:** "An attacker compromises a Tier 1 frontend pod and attempts to directly scan or connect to the Cloud SQL database IP (`10.230.160.x:5432`) to bypass the API layer."
+> **Interview Context:** "An attacker compromises a Tier 1 frontend pod and attempts to directly scan or connect to the Cloud SQL database IP (`10.230.160.x:5432`) to bypass the API layer. How do you verify your Zero-Trust boundary blocks the attack?"
 
-* **How to Break (Execute Attack Simulation):**
+* **Step 1: Execute the Attack Simulation (Penetration Test):**
   ```bash
-  # Option A: Get Cloud SQL Private IP directly via gcloud (Recommended - No Terraform state needed)
+  # 1. Fetch Cloud SQL Private IP
   CLOUDSQL_IP=$(gcloud sql instances describe cloudsql-3tier-db --format="value(ipAddresses[0].ipAddress)")
 
-  # Option B (If local Terraform state exists):
-  # CLOUDSQL_IP=$(cd phase2/terraform && terraform output -raw cloudsql_private_ip)
-
+  # 2. Get frontend pod name
   FRONTEND_POD=$(kubectl get pods -l app=frontend -o jsonpath='{.items[0].metadata.name}')
+
+  # 3. Attempt direct TCP connection from Frontend to Database
   kubectl exec -it $FRONTEND_POD -- nc -zv -w 3 $CLOUDSQL_IP 5432
   ```
 
-* **What to Check & Diagnostic Commands:**
-  *Observed Attack Simulation Output:*
+* **What to Check & Why "Operation timed out" is a 100% SUCCESS:**
+  *Observed Output:*
   ```text
-  nc: connect to 10.230.160.3 port 5432 (tcp) timed out: Operation now in progress
+  nc: 10.230.160.3 (10.230.160.3:5432): Operation timed out
+  command terminated with exit code 1
   ```
-  *Verify Active Defense Rules:*
+  > [!NOTE]
+  > **This is the EXPECTED and DESIRED result!**
+  > A timeout (`exit code 1`) means your **NetworkPolicy successfully blocked the attacker** at the Linux kernel socket level. In a secure 3-tier architecture, the frontend must NEVER be able to establish a TCP connection directly with the database.
+
+* **Step 2: How to Simulate a Real Security Breach (How to "Break" the Security Boundary):**
+  If a junior engineer accidentally edits `phase2/k8s/01-network-policies.yaml` and adds an illegal database egress rule to `allow-tier1-frontend`:
+  ```yaml
+  # In allow-tier1-frontend (ILLEGAL EGRESS LEAK):
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 10.230.160.0/20
+      ports:
+        - protocol: TCP
+          port: 5432 # Security violation: Frontend can now touch DB directly!
+  ```
   ```bash
-  kubectl get netpol allow-tier1-frontend -o yaml
-  # Confirm egress ONLY permits destination app: backend on port 8080
+  kubectl apply -f phase2/k8s/01-network-policies.yaml
+  ```
+  *When you re-run the attack simulation, the connection UNEXPECTEDLY SUCCEEDS (Security Hole):*
+  ```bash
+  kubectl exec -it $FRONTEND_POD -- nc -zv -w 3 $CLOUDSQL_IP 5432
+  # Output: 10.230.160.3 (10.230.160.3:5432) open  <-- SECURITY VULNERABILITY!
   ```
 
-* **The Learn (Root Cause Analysis):**
-  Under GKE Dataplane V2 (Cilium eBPF), packets originating from frontend pods destined for `10.230.160.3:5432` are dropped immediately at the Linux kernel socket level before traversing the node's physical NIC. The database layer remains completely immune to frontend compromise.
+* **Step 3: How to Fix (Restore Zero-Trust Isolation):**
+  Remove the database IP rule from `allow-tier1-frontend` so it ONLY allows egress to `app: backend` on port `8080`:
+  ```yaml
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: backend
+              tier: tier2
+      ports:
+        - protocol: TCP
+          port: 8080
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+  ```
+  ```bash
+  kubectl apply -f phase2/k8s/01-network-policies.yaml
+  ```
 
-* **How to Fix:**
-  No fix needed — this demonstrates verified **Zero-Trust Network Segmentation** in action!
+* **Verification:**
+  ```bash
+  kubectl exec -it $FRONTEND_POD -- nc -zv -w 3 $CLOUDSQL_IP 5432
+  # Expected: Operation timed out (Database is fully protected!)
+  ```
 
 ---
 
