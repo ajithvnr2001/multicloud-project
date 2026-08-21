@@ -1575,7 +1575,12 @@ export ZONE="us-east4-a"
 
 * **How to Break (Execute Attack Simulation):**
   ```bash
-  CLOUDSQL_IP=$(cd phase2/terraform && terraform output -raw cloudsql_private_ip)
+  # Option A: Get Cloud SQL Private IP directly via gcloud (Recommended - No Terraform state needed)
+  CLOUDSQL_IP=$(gcloud sql instances describe cloudsql-3tier-db --format="value(ipAddresses[0].ipAddress)")
+
+  # Option B (If local Terraform state exists):
+  # CLOUDSQL_IP=$(cd phase2/terraform && terraform output -raw cloudsql_private_ip)
+
   FRONTEND_POD=$(kubectl get pods -l app=frontend -o jsonpath='{.items[0].metadata.name}')
   kubectl exec -it $FRONTEND_POD -- nc -zv -w 3 $CLOUDSQL_IP 5432
   ```
