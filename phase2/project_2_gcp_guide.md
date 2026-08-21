@@ -1101,6 +1101,7 @@ export ZONE="us-east4-a"
   ```
   *(Or Scenario B: Remove the GCP IAM Workload Identity binding)*
   ```bash
+  PROJECT_ID=$(gcloud config get-value project)
   gcloud iam service-accounts remove-iam-policy-binding \
     sa-app-backend@${PROJECT_ID}.iam.gserviceaccount.com \
     --role="roles/iam.workloadIdentityUser" \
@@ -1135,6 +1136,7 @@ export ZONE="us-east4-a"
      # Notice literal "PROJECT_ID" instead of real project ID!
 
      # Check GCP IAM Policy Binding
+     PROJECT_ID=$(gcloud config get-value project)
      gcloud iam service-accounts get-iam-policy sa-app-backend@${PROJECT_ID}.iam.gserviceaccount.com
      ```
 
@@ -1143,6 +1145,8 @@ export ZONE="us-east4-a"
 
 * **How to Fix:**
   ```bash
+  PROJECT_ID=$(gcloud config get-value project)
+
   # 1. Update KSA annotation with real GCP project ID
   kubectl annotate serviceaccount ksa-app-backend --overwrite \
     iam.gke.io/gcp-service-account="sa-app-backend@${PROJECT_ID}.iam.gserviceaccount.com"
@@ -1466,7 +1470,8 @@ export ZONE="us-east4-a"
 * **How to Break:**
   Revoke the `roles/cloudsql.client` role from the backend Service Account:
   ```bash
-  gcloud projects remove-iam-policy-binding ${PROJECT_ID} \
+  PROJECT_ID=$(gcloud config get-value project)
+  gcloud projects remove-iam-policy-binding "${PROJECT_ID}" \
     --member="serviceAccount:sa-app-backend@${PROJECT_ID}.iam.gserviceaccount.com" \
     --role="roles/cloudsql.client"
 
@@ -1486,7 +1491,8 @@ export ZONE="us-east4-a"
      ```
   2. **Verify Project-Level IAM Roles for the GSA:**
      ```bash
-     gcloud projects get-iam-policy ${PROJECT_ID} \
+     PROJECT_ID=$(gcloud config get-value project)
+     gcloud projects get-iam-policy "${PROJECT_ID}" \
        --flatten="bindings[].members" \
        --filter="bindings.members:sa-app-backend@${PROJECT_ID}.iam.gserviceaccount.com" \
        --format="table(bindings.role)"
@@ -1499,7 +1505,8 @@ export ZONE="us-east4-a"
 * **How to Fix:**
   Re-grant `roles/cloudsql.client` to the service account:
   ```bash
-  gcloud projects add-iam-policy-binding ${PROJECT_ID} \
+  PROJECT_ID=$(gcloud config get-value project)
+  gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
     --member="serviceAccount:sa-app-backend@${PROJECT_ID}.iam.gserviceaccount.com" \
     --role="roles/cloudsql.client"
 
